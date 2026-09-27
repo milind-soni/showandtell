@@ -1,0 +1,20 @@
+{
+  "name": "showandtell",
+  "interface": {
+    "displayName": "Showandtell"
+  },
+  "plugins": [
+    {
+      "name": "showandtell",
+      "source": {
+        "source": "local",
+        "path": "./plugins/showandtell"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
