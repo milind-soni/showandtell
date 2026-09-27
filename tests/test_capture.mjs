@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readFile, mkdtemp, mkdir, readdir, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import vm from "node:vm";
 import test from "node:test";
 
@@ -81,6 +83,15 @@ test("fresh call scopes reuse one recorder without nested capture", async () => 
   assert.equal(actions.length, 3);
   assert.deepEqual(actions.map((e) => e.id.split("-").at(-1)), ["1", "2", "3"]);
   assert.equal(f.events.filter((e) => e.kind === "image").length, 6);
+});
+
+test("older recorder registry cannot suppress the direct capture API", async () => {
+  const old = { wrap(value) { return value; } };
+  const context = vm.createContext({ __showandtellCaptureV1: old, cua: {}, nodeRepl: { write() {} } });
+  vm.runInContext(source, context);
+  assert.equal(context.__showandtellCaptureV1, old);
+  assert.notEqual(context.__showandtell, old);
+  assert.equal(typeof context.__showandtell.saveTo, "function");
 });
 
 test("existing const handles can be instrumented in place", async () => {
@@ -188,4 +199,43 @@ test("image emission failure warns with its frame identity and preserves actions
   assert.equal(warnings[1].phase, "after");
   assert.equal(f.events.at(-1).status, "ok");
   assert.equal(JSON.stringify(f.events).includes("private image failure"), false);
+});
+
+test("direct capture saves large bytes privately without tool-result images and switches calls", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "showandtell-capture-"));
+  const bytes = new Uint8Array(1_100_000).fill(37);
+  const writes = [];
+  let clicks = 0;
+  const app = { async getScreenshot() { return bytes; }, async click() { clicks++; return 42; } };
+  const api = { async getApp() { return app; } };
+  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+  try {
+    // Native CUA supports Node imports; exercise the same import outside vm contexts.
+    const recorder = await new AsyncFunction("cua", "nodeRepl", source + "\nreturn __showandtell;")(
+      api, { write(value) { writes.push(value); }, emitImage() { assert.fail("Images must stay on disk"); } });
+    for (const call of ["one", "two"]) {
+      const folder = join(directory, call);
+      await mkdir(folder);
+      await recorder.saveTo(folder);
+      assert.equal(await (await api.getApp()).click([10, 20]), 42);
+      const entries = (await readFile(join(folder, "events.jsonl"), "utf8")).trim().split("\n").map(JSON.parse);
+      assert.deepEqual(entries.map((entry) => entry.kind), ["frame", "action", "frame", "status"]);
+      assert.equal(entries[1].x, 10);
+      assert.equal(entries[3].status, "ok");
+      assert.equal((await readdir(folder)).length, 3);
+      for (const entry of entries.filter((entry) => entry.image)) {
+        assert.deepEqual(new Uint8Array(await readFile(join(folder, entry.image))), bytes);
+        assert.equal((await stat(join(folder, entry.image))).mode & 0o777, 0o600);
+      }
+    }
+    assert.equal(clicks, 2);
+    assert.deepEqual(writes, []);
+    // Storage failure must preserve the requested computer action, even if output also fails.
+    await recorder.saveTo(join(directory, "missing"));
+    assert.equal(await (await api.getApp()).click([1, 2]), 42);
+    assert.ok(writes.some((value) => value.includes("capture-storage-unavailable")));
+  } finally {
+    delete globalThis.__showandtellCaptureV2;
+    await rm(directory, { recursive: true, force: true });
+  }
 });

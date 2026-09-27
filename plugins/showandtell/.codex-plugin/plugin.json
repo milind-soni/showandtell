@@ -1,6 +1,6 @@
 {
   "name": "showandtell",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Turn Codex computer-use screenshots and actions into local videos with smooth cursor motion.",
   "author": {
     "name": "Milind Soni"
@@ -9,10 +9,26 @@
   "interface": {
     "displayName": "Showandtell",
     "shortDescription": "Computer use becomes a video.",
-    "longDescription": "Local screenshot capture, smooth cursor animations, and automatic MP4 export for Codex computer use. Python and FFmpeg; no recording server.",
+    "longDescription": "Turn supported Codex computer-use actions into local MP4 walkthroughs with smooth cursor motion. Saves screenshots directly on your Mac and renders with FFmpeg. Requires desktop computer use, Python 3.10+, FFmpeg, and trusted command hooks. Captures snapshots rather than continuous screen footage.",
     "developerName": "Milind Soni",
     "category": "Productivity",
     "capabilities": [],
-    "defaultPrompt": "Use Showandtell to turn this computer-use walkthrough into a video."
-  }
+    "defaultPrompt": [
+      "Use Showandtell to make a video of this walkthrough.",
+      "Use Showandtell to export my saved capture as an MP4."
+    ],
+    "websiteURL": "https://github.com/milind-soni/showandtell",
+    "privacyPolicyURL": "https://github.com/milind-soni/showandtell/blob/main/PRIVACY.md",
+    "brandColor": "#8CAFFF",
+    "logo": "./assets/logo.png",
+    "composerIcon": "./assets/logo.png"
+  },
+  "homepage": "https://github.com/milind-soni/showandtell",
+  "repository": "https://github.com/milind-soni/showandtell",
+  "keywords": [
+    "computer-use",
+    "video",
+    "walkthrough",
+    "cursor"
+  ]
 }

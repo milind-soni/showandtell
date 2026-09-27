@@ -2,8 +2,10 @@ __pycache__/
 *.pyc
 .showandtell/
 .DS_Store
+dist/
 *.mp4
 *.jpg
 *.png
 !demo/preview.png
 !demo/showandtell.mp4
+!plugins/showandtell/assets/*.png

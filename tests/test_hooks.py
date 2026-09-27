@@ -212,6 +212,83 @@ class HookTests(unittest.TestCase):
         self.assertEqual(second["calls"], ["call-1"])
         self.assertEqual(len(second["frames"]), 1)
 
+    def test_direct_capture_survives_truncated_tool_output_and_stop_recovers_pending(self):
+        self.pre('let app = await cua.getApp("Example");')
+        injected = hooks.hook(self.event("PreToolUse", tool_use_id="live", tool_input={
+            "code": "await app.click([1, 2]);"}))["hookSpecificOutput"]["updatedInput"]["code"]
+        folder = next((self.turn / "captures").iterdir())
+        self.assertIn('await __showandtell.saveTo(' + json.dumps(str(folder.resolve())) + ')', injected)
+        self.assertEqual(folder.stat().st_mode & 0o777, 0o700)
+        # Large valid PNG payload models the native result that exceeds transcript limits.
+        padding = b"description\x00" + b"x" * 1_100_000
+        chunk = (struct.pack(">I", len(padding)) + b"tEXt" + padding
+                 + struct.pack(">I", zlib.crc32(b"tEXt" + padding) & 0xffffffff))
+        screenshot = png()[:-12] + chunk + png()[-12:]
+        (folder / "before.img").write_bytes(screenshot)
+        (folder / "after.img").write_bytes(png((0, 255, 0)))
+        (folder / "events.jsonl").write_text("\n".join([
+            marker("frame", id="a", surface="app:1", phase="before", t=10, image="before.img"),
+            marker("action", id="a", surface="app:1", type="click", t=11, x=1, y=2),
+            marker("frame", id="a", surface="app:1", phase="after", t=12, image="after.img"),
+            marker("status", id="a", status="ok", t=13),
+        ]) + '\n{"interrupted":')
+        hooks.hook(self.event("PostToolUse", tool_use_id="live", tool_response="truncated"))
+        saved = json.loads((self.turn / "session.json").read_text())
+        self.assertEqual([(f["phase"], f["t"]) for f in saved["frames"]], [("before", 10), ("after", 12)])
+        self.assertEqual((self.turn / saved["frames"][0]["file"]).read_bytes(), screenshot)
+        self.assertEqual(saved["actions"][0]["status"], "ok")
+        self.assertEqual(saved["warnings"], [])
+        self.assertFalse(folder.exists())
+        self.assertFalse(hooks.collect_pending(self.turn))
+        hooks.hook(self.event("PostToolUse", tool_use_id="live", tool_response={"content": [image()]}))
+        self.assertEqual(json.loads((self.turn / "session.json").read_text()), saved)
+        # If PostToolUse never arrived, Stop still recovers the on-disk recording.
+        self.pre("await app.click([3, 4]);")
+        folder = next((self.turn / "captures").iterdir())
+        (folder / "events.jsonl").write_text(marker("action", id="b", surface="app:1", type="click", t=14, x=3, y=4))
+        renderer = types.ModuleType("render")
+        renderer.render_session = Mock(return_value={"duration": 1})
+        with patch.dict(sys.modules, {"render": renderer}):
+            hooks.hook(self.event("Stop"))
+        saved = json.loads((self.turn / "session.json").read_text())
+        self.assertEqual([a["id"] for a in saved["actions"]], ["a", "b"])
+
+    def test_direct_capture_rejects_paths_and_symlinks(self):
+        outside = self.home / "outside.img"
+        outside.write_bytes(png())
+        pending = self.turn / "captures"
+        pending.mkdir(parents=True)
+        for index, name in enumerate(("../../outside.img", str(outside), "linked.img")):
+            folder = pending / f"{index:032x}"
+            folder.mkdir()
+            (folder / "linked.img").symlink_to(outside)
+            (folder / "events.jsonl").write_text(marker("frame", id="a", t=10, phase="after", image=name))
+        linked_folder = pending / ("f" * 32)
+        linked_folder.symlink_to(self.home, target_is_directory=True)
+        self.assertTrue(hooks.collect_pending(self.turn))
+        saved = json.loads((self.turn / "session.json").read_text())
+        self.assertEqual(saved["frames"], [])
+        self.assertTrue(saved["warnings"])
+        self.assertTrue(outside.exists())
+        self.assertTrue(linked_folder.is_symlink())
+
+    def test_post_tool_collects_only_its_call_and_preserves_inflight_captures(self):
+        pending = self.turn / "captures"
+        for call in ("one", "two"):
+            folder = pending / hooks.capture_id(call)
+            folder.mkdir(parents=True)
+            (folder / "events.jsonl").write_text(marker("action", id=call, type="click", t=10))
+        hooks.hook(self.event("PostToolUse", tool_use_id="one", tool_response={}))
+        saved = json.loads((self.turn / "session.json").read_text())
+        self.assertEqual([a["id"] for a in saved["actions"]], ["one"])
+        self.assertTrue((pending / hooks.capture_id("two")).exists())
+        renderer = types.ModuleType("render")
+        renderer.render_session = Mock()
+        with patch.dict(sys.modules, {"render": renderer}):
+            hooks.hook(self.event("Stop"))
+        saved = json.loads((self.turn / "session.json").read_text())
+        self.assertEqual([a["id"] for a in saved["actions"]], ["one", "two"])
+
     def test_stop_renders_once_per_manifest_and_uses_the_turn_id(self):
         self.collect([image()], recorded_at=10)
         renderer = types.ModuleType("render")

@@ -2,17 +2,17 @@
   "hooks": {
     "PreToolUse": [{
       "matcher": "^mcp__cua_repl(__|\\.)js$",
-      "hooks": [{"type": "command", "command": "python3 \"${PLUGIN_ROOT}/scripts/showandtell.py\" hook", "timeout": 10}]
+      "hooks": [{"type": "command", "command": "sh \"${PLUGIN_ROOT}/scripts/run.sh\" hook", "timeout": 10}]
     }],
     "PostToolUse": [{
       "matcher": "^mcp__cua_repl(__|\\.)js(_reset)?$",
-      "hooks": [{"type": "command", "command": "python3 \"${PLUGIN_ROOT}/scripts/showandtell.py\" hook", "timeout": 30}]
+      "hooks": [{"type": "command", "command": "sh \"${PLUGIN_ROOT}/scripts/run.sh\" hook", "timeout": 30}]
     }],
     "SessionStart": [{
-      "hooks": [{"type": "command", "command": "python3 \"${PLUGIN_ROOT}/scripts/showandtell.py\" hook", "timeout": 10}]
+      "hooks": [{"type": "command", "command": "sh \"${PLUGIN_ROOT}/scripts/run.sh\" hook", "timeout": 10}]
     }],
     "Stop": [{
-      "hooks": [{"type": "command", "command": "python3 \"${PLUGIN_ROOT}/scripts/showandtell.py\" hook", "timeout": 600}]
+      "hooks": [{"type": "command", "command": "sh \"${PLUGIN_ROOT}/scripts/run.sh\" hook", "timeout": 600}]
     }]
   }
 }

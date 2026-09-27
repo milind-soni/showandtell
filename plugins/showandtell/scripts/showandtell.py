@@ -11,10 +11,12 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import struct
 import sys
 import tempfile
 import time
+import uuid
 
 HERE = Path(__file__).resolve().parent
 CUA = re.compile(r'^mcp__cua_repl(?:__|\.)js$')
@@ -129,6 +131,66 @@ def markers(text):
             yield obj
 
 
+def capture_file(path, limit):
+    """Read only a bounded regular file from our private capture spool."""
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), 'rb') as handle:
+        info = os.fstat(handle.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            raise ValueError('Invalid capture file')
+        raw = handle.read(limit + 1)
+        if len(raw) > limit:
+            raise ValueError('Oversized capture file')
+        return raw
+
+
+def capture_id(value):
+    return hashlib.sha256(str(value).encode()).hexdigest()[:32]
+
+
+def collect_pending(directory, call_id=None):
+    """Collect direct CUA captures even when its tool result was truncated."""
+    directory = Path(directory)
+    if call_id and 'capture:' + capture_id(call_id) in read_json(directory / 'session.json', {}).get('calls', []):
+        return True
+    pending = directory / 'captures'
+    if not pending.is_dir() or pending.is_symlink():
+        return False
+    captured = False
+    folders = [pending / capture_id(call_id)] if call_id else sorted(pending.iterdir())
+    for folder in folders:
+        if not re.fullmatch(r'[0-9a-f]{32}', folder.name) or folder.is_symlink() or not folder.is_dir():
+            continue
+        blocks = []
+        try:
+            lines = capture_file(folder / 'events.jsonl', 8_000_000).splitlines()
+        except (OSError, ValueError):
+            continue
+        for line in lines:
+            try:
+                marker = json.loads(line)
+            except (ValueError, UnicodeError):
+                continue  # An interrupted tool may leave its last write incomplete.
+            if not isinstance(marker, dict) or marker.get('showandtell') != 1:
+                continue
+            if marker.get('kind') == 'frame':
+                name = marker.get('image')
+                try:
+                    if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}\.img', name):
+                        raise ValueError('Invalid screenshot filename')
+                    raw = capture_file(folder / name, 21_000_000)
+                    image_info(raw)
+                except (OSError, ValueError, struct.error):
+                    marker = {'showandtell': 1, 'kind': 'warning', 'reason': 'capture-image-unavailable'}
+                else:
+                    blocks.append({'type': 'image', '_capture_bytes': raw})
+            blocks.append({'type': 'text', 'text': json.dumps(marker)})
+        if blocks:
+            collect({'tool_use_id': 'capture:' + folder.name, 'tool_response': {'content': blocks}}, directory)
+            captured = True
+        shutil.rmtree(folder)
+    return captured
+
+
 def collect(event, directory):
     directory = Path(directory)
     with locked(directory):
@@ -186,13 +248,14 @@ def collect(event, directory):
                         session['warnings'].append('Capture could not instrument an action or obtain a screenshot.')
             elif block.get('type') == 'image':
                 pending = frame_markers.pop(0) if frame_markers and not ambiguous else None
-                encoded = block.get('data', '')
-                if not isinstance(encoded, str) or len(encoded) > 28_000_000:
-                    session['warnings'].append('Skipped an oversized screenshot.')
-                    pending = None
-                    continue
                 try:
-                    raw = base64.b64decode(encoded, validate=True)
+                    raw = block.get('_capture_bytes')
+                    if not isinstance(raw, bytes):
+                        encoded = block.get('data', '')
+                        if not isinstance(encoded, str) or len(encoded) > 28_000_000:
+                            session['warnings'].append('Skipped an oversized screenshot.')
+                            continue
+                        raw = base64.b64decode(encoded, validate=True)
                     extension, width, height = image_info(raw)
                 except (ValueError, struct.error):
                     session['warnings'].append('Skipped an invalid or unsupported screenshot.')
@@ -257,6 +320,13 @@ def hook(event):
         if first:
             return {}  # Preserve CUA's required first-call bootstrap verbatim.
         setup = (HERE / 'capture.js').read_text()
+        turn_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        pending = turn_dir / 'captures'
+        pending.mkdir(exist_ok=True, mode=0o700)
+        call_id = event.get('tool_use_id')
+        capture_dir = pending / (capture_id(call_id) if call_id else uuid.uuid4().hex)
+        capture_dir.mkdir(mode=0o700)
+        setup += '\nawait __showandtell.saveTo(' + json.dumps(str(capture_dir.resolve())) + ');'
         for name, binding in previous.items():
             if name in declared:
                 continue
@@ -265,8 +335,18 @@ def hook(event):
         return {'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'allow',
                                       'updatedInput': {**args, 'code': setup + '\n' + code}}}
     if kind == 'PostToolUse':
-        collect(event, turn_dir)
+        if collect_pending(turn_dir, event.get('tool_use_id')):
+            warnings = [marker for block in content_blocks(event.get('tool_response', {}))
+                        if isinstance(block, dict) and block.get('type') == 'text'
+                        for marker in markers(str(block.get('text', ''))) if marker.get('kind') == 'warning']
+            if warnings:
+                collect({**event, 'tool_response': {'content': [
+                    {'type': 'text', 'text': json.dumps(marker)} for marker in warnings]}}, turn_dir)
+        else:
+            collect(event, turn_dir)
         return {}
+    if kind == 'Stop':
+        collect_pending(turn_dir)
     if kind == 'Stop' and (turn_dir / 'session.json').exists():
         from render import render_session
         with locked(turn_dir):

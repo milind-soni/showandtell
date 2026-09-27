@@ -1,6 +1,6 @@
 // Inject only after CUA's first discovery call. This uses public CUA methods only.
 // CUA evaluates calls in fresh scopes, so a local var cannot guard reinjection.
-var __showandtell = globalThis.__showandtellCaptureV1 ||= (() => {
+var __showandtell = globalThis.__showandtellCaptureV2 ||= (() => {
     const actions = new Set([
       "click", "drag", "scroll", "typeText", "paste", "pressKey", "setValue",
       "selectText", "performSecondaryAction", "goto", "back", "forward", "reload",
@@ -19,6 +19,19 @@ var __showandtell = globalThis.__showandtellCaptureV1 ||= (() => {
     let sequence = 0;
     let surfaceSequence = 0;
     let output = Promise.resolve();
+    let destination = null;
+    const saveTo = async (directory) => {
+      await output;
+      try { await destination?.file?.close(); } catch (_) {}
+      destination = { directory };
+      try {
+        const fs = await import("node:fs/promises");
+        destination = { directory, fs, file: await fs.open(directory + "/events.jsonl", "wx", 0o600) };
+      } catch (_) {
+        try { await nodeRepl.write(JSON.stringify({ showandtell: 1, kind: "warning",
+          reason: "capture-storage-unavailable" }) + "\n"); } catch (_) {}
+      }
+    };
     const surfaceFor = (target, kind) => {
       if (!surfaces.has(target)) {
         surfaces.set(target, `${kind === "browser" ? "browser" : "app"}:${++surfaceSequence}`);
@@ -28,7 +41,24 @@ var __showandtell = globalThis.__showandtellCaptureV1 ||= (() => {
     const point = (value) => Array.isArray(value) && value.length === 2 &&
       value.every((n) => typeof n === "number" && Number.isFinite(n)) ? value : null;
     const emit = (event, image) => {
+      const sink = destination;
       output = output.then(async () => {
+        if (sink) {
+          try {
+            if (!sink.file) return;
+            const entry = { showandtell: 1, ...event };
+            if (image !== undefined) {
+              entry.image = event.id + "-" + event.phase + ".img";
+              await sink.fs.writeFile(sink.directory + "/" + entry.image, image,
+                { flag: "wx", mode: 0o600 });
+            }
+            await sink.file.write(JSON.stringify(entry) + "\n");
+          } catch (_) {
+            await nodeRepl.write(JSON.stringify({ showandtell: 1, kind: "warning",
+              reason: "capture-storage-write-failed" }) + "\n");
+          }
+          return;
+        }
         await nodeRepl.write(JSON.stringify({ showandtell: 1, ...event }) + "\n");
         if (image !== undefined) {
           try { await nodeRepl.emitImage(image); }
@@ -139,6 +169,6 @@ var __showandtell = globalThis.__showandtellCaptureV1 ||= (() => {
         } catch (_) { warn(name); }
       }
     };
-    return { instrument, wrap, install };
+    return { instrument, wrap, install, saveTo };
   })();
 try { __showandtell.install(cua); } catch (_) {}
