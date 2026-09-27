@@ -35,11 +35,12 @@ Export is headless. Capture uses Codex's existing app/browser access; native app
 - **Coordinate clicks and drags:** full animated cursor. Accessibility-index actions: screenshots and state changes, but no invented cursor position. The public API does not reveal their resolved targets.
 - **Snapshots, not live footage:** page animation, scroll transitions, and per-character typing between snapshots are not preserved. Cursor movement is reconstructed, not the original ghost cursor's exact trajectory.
 - Use unified `cua` app/tab methods and mutable `let`/`var` handles. First discovery remains untouched. Initial `const` handles on immutable targets can miss capture; the bundled skill explains recovery. Older browser-only tools and direct Playwright calls are not instrumented.
-- Native screenshots can already contain Codex's ghost cursor. This release cannot reliably remove it; a native export can show that baked-in pointer as well as the synthetic one. The tested browser screenshots are clean.
+- Native screenshots may already contain Codex's ghost cursor. Showandtell cannot reliably remove it, so native videos can show duplicate cursors. The tested browser screenshots are clean.
 - Keep unrelated image emissions out of an action call. Codex groups text and images separately; a mismatched image/marker count is reported and cursor association is withheld.
-- Screenshots are emitted through the tool result, adding capture time and image tokens. Long turns take longer to render; interrupted exports can be rerun. Existing transcripts only recover what was actually saved.
+- Screenshots are emitted through the tool result, adding capture time and image tokens. Long turns take longer to render; interrupted exports can be rerun.
+- Saved transcripts can truncate image output, especially large native screenshots. Import cannot reconstruct missing image data; recovery may produce an incomplete video or no video.
 - Hook handlers and a real capture/export were tested separately. The normal user-trusted hook dispatcher must be enabled in your installation; this project does not silently grant that trust.
-- Native screenshot bytes were verified and normalized across the runtime boundary. A live native action was interrupted by an app focus change; the completed end-to-end live action test is the browser demo above.
+- The Blender native test exported nine UI actions and 18 screenshots into a 29.65-second, 60 fps video using a temporary local sidecar because transcript images were truncated. This does not verify automatic native capture/export through the hook dispatcher.
 
 ## Local tools
 

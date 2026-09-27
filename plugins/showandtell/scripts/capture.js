@@ -1,7 +1,6 @@
 // Inject only after CUA's first discovery call. This uses public CUA methods only.
-var __showandtell = typeof __showandtell === "object" && __showandtell
-  ? __showandtell
-  : (() => {
+// CUA evaluates calls in fresh scopes, so a local var cannot guard reinjection.
+var __showandtell = globalThis.__showandtellCaptureV1 ||= (() => {
     const actions = new Set([
       "click", "drag", "scroll", "typeText", "paste", "pressKey", "setValue",
       "selectText", "performSecondaryAction", "goto", "back", "forward", "reload",

@@ -63,6 +63,26 @@ test("repeated bootstrap and repeated wrapping do not double capture", async () 
   assert.equal(f.events.find((e) => e.kind === "action").x, null);
 });
 
+test("fresh call scopes reuse one recorder without nested capture", async () => {
+  const f = fixture();
+  f.context.existing = await f.cua.getApp("Example");
+  const helper = f.context.__showandtell;
+  for (let i = 0; i < 3; i++) {
+    const reused = await vm.runInContext(`(async () => {
+      ${source}
+      existing = __showandtell.wrap(existing);
+      await existing.click([1, 2]);
+      return __showandtell;
+    })()`, f.context);
+    assert.equal(reused, helper);
+  }
+  assert.equal(f.calls.length, 3);
+  const actions = f.events.filter((e) => e.kind === "action");
+  assert.equal(actions.length, 3);
+  assert.deepEqual(actions.map((e) => e.id.split("-").at(-1)), ["1", "2", "3"]);
+  assert.equal(f.events.filter((e) => e.kind === "image").length, 6);
+});
+
 test("existing const handles can be instrumented in place", async () => {
   const f = fixture();
   f.context.existing = f.target;

@@ -92,8 +92,10 @@ def image_info(raw):
     return extension, width, height
 
 
-def content_blocks(response):
+def content_blocks(response, depth=0):
     """Only inspect result containers; never open URLs or referenced local files."""
+    if depth >= 8:
+        return []
     if isinstance(response, str):
         try:
             response = json.loads(response)
@@ -102,8 +104,17 @@ def content_blocks(response):
     if not isinstance(response, dict):
         return []
     if isinstance(response.get('content'), list):
-        return response['content']
-    return content_blocks(response['result']) if 'result' in response else []
+        blocks = response['content']
+        # Saved CUA calls can wrap their entire result in one JSON text block.
+        if len(blocks) == 1 and isinstance(blocks[0], dict) and blocks[0].get('type') == 'text':
+            try:
+                nested = json.loads(blocks[0].get('text', ''))
+            except (ValueError, TypeError):
+                nested = None
+            if isinstance(nested, dict) and isinstance(nested.get('content'), list):
+                return content_blocks(nested, depth + 1)
+        return blocks
+    return content_blocks(response['result'], depth + 1) if 'result' in response else []
 
 
 def markers(text):

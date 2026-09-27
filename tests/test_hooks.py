@@ -142,6 +142,26 @@ class HookTests(unittest.TestCase):
             self.assertEqual((self.turn / frame["file"]).read_bytes(), png(color))
             self.assertEqual((frame["width"], frame["height"]), (2, 2))
 
+    def test_import_unwraps_saved_cua_json_text_result(self):
+        text = (marker("frame", id="a", surface="app", phase="before", t=10)
+                + marker("action", id="a", surface="app", type="click", t=11, x=1, y=1)
+                + marker("frame", id="a", surface="app", phase="after", t=12)
+                + marker("status", id="a", status="ok", t=13))
+        inner = {"content": [{"type": "text", "text": text}, image(), image((0, 255, 0))]}
+        result = {"content": [{"type": "text", "text": json.dumps(inner)}]}
+        transcript = self.home / "rollout.jsonl"
+        transcript.write_text(json.dumps({"timestamp": "2026-09-27T12:00:00Z", "payload": {
+            "type": "item_completed", "item": {"type": "McpToolCall", "server": "cua_repl",
+            "id": "live-call", "result": result}}}) + "\n")
+        hooks.import_transcript(transcript, self.turn)
+        saved = json.loads((self.turn / "session.json").read_text())
+        self.assertEqual([(f["phase"], f["t"]) for f in saved["frames"]], [("before", 10), ("after", 12)])
+        self.assertEqual(saved["actions"][0]["status"], "ok")
+        self.assertEqual(saved["warnings"], [])
+        self.assertEqual((self.turn / saved["frames"][1]["file"]).read_bytes(), png((0, 255, 0)))
+        ordinary = {"type": "text", "text": json.dumps({"showandtell": 1, "kind": "action"})}
+        self.assertEqual(hooks.content_blocks({"content": [ordinary]}), [ordinary])
+
     def test_invalid_markers_and_images_warn_without_storing_actions(self):
         text = (marker("action", type="unsupported", t=1)
                 + marker("action", type="click", t="invalid")
