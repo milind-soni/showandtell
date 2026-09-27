@@ -2,7 +2,7 @@
 
 Showandtell is a local Codex plugin maintained by Milind Soni. It does not operate a recording server, require a Showandtell account, or send recordings to the maintainer.
 
-When its command hooks are enabled, it saves screenshots before and after supported computer-use actions, action times, surface identifiers, action kinds, available pointer coordinates, and success/failure status. Capture is active in chats where the plugin and its hooks are enabled. Screenshots can contain anything visible in the selected app or browser tab, including private information.
+When its command hooks are enabled, it saves normal screenshot observations from supported computer-use methods, action times, surface identifiers, action kinds, available pointer coordinates, and success/failure status. Default reuse mode does not request extra screenshots. Optional full mode captures extra screenshots before and after actions. Capture is active in chats where the plugin and its hooks are enabled. Screenshots can contain anything visible in the selected app or browser tab, including private information.
 
 Showandtell's action metadata omits typed text, key values, URLs, and raw tool code. That does not remove information visible in screenshots. Codex itself continues handling the conversation and normal tool results under its own settings and policies; Showandtell does not change that behavior.
 

@@ -326,7 +326,8 @@ def hook(event):
         call_id = event.get('tool_use_id')
         capture_dir = pending / (capture_id(call_id) if call_id else uuid.uuid4().hex)
         capture_dir.mkdir(mode=0o700)
-        setup += '\nawait __showandtell.saveTo(' + json.dumps(str(capture_dir.resolve())) + ');'
+        mode = 'full' if os.environ.get('SHOWANDTELL_CAPTURE') == 'full' else 'reuse'
+        setup += '\nawait __showandtell.saveTo(' + json.dumps(str(capture_dir.resolve())) + ', ' + json.dumps(mode) + ');'
         for name, binding in previous.items():
             if name in declared:
                 continue
@@ -356,7 +357,9 @@ def hook(event):
                 return {}
             manifest = read_json(turn_dir / 'session.json', {})
             if not manifest.get('frames'):
-                return {}
+                return {'systemMessage': 'Showandtell saved action metadata but no screenshot frames, so no video was rendered. '
+                        'Reuse mode needs normal getScreenshot or getAXStateAndScreenshot observations. '
+                        'Text-only accessibility observations are not video frames.'}
             result = render_session(turn_dir, turn_dir / 'video.mp4')
             atomic_json(turn_dir / 'export.json', {**result, 'digest': digest})
         return {'systemMessage': 'Showandtell video: ' + str(turn_dir / 'video.mp4')}

@@ -1,6 +1,6 @@
 {
   "name": "showandtell",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Turn Codex computer-use screenshots and actions into local videos with smooth cursor motion.",
   "author": {
     "name": "Milind Soni"
@@ -9,7 +9,7 @@
   "interface": {
     "displayName": "Showandtell",
     "shortDescription": "Computer use becomes a video.",
-    "longDescription": "Turn supported Codex computer-use actions into local MP4 walkthroughs with smooth cursor motion. Saves screenshots directly on your Mac and renders with FFmpeg. Requires desktop computer use, Python 3.10+, FFmpeg, and trusted command hooks. Captures snapshots rather than continuous screen footage.",
+    "longDescription": "Turn supported Codex computer-use actions into local MP4 walkthroughs with smooth cursor motion. Reuses normal screenshot observations and renders in the background with FFmpeg. Requires desktop computer use, Python 3.10+, FFmpeg, and trusted command hooks. Text-only observations cannot produce a video.",
     "developerName": "Milind Soni",
     "category": "Productivity",
     "capabilities": [],

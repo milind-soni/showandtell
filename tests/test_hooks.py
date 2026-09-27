@@ -46,7 +46,7 @@ class HookTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name)
         self.environment = patch.dict(os.environ, {
-            "SHOWANDTELL_HOME": str(self.home), "SHOWANDTELL_DISABLED": "0",
+            "SHOWANDTELL_HOME": str(self.home), "SHOWANDTELL_DISABLED": "0", "SHOWANDTELL_CAPTURE": "reuse",
         })
         self.environment.start()
         self.addCleanup(self.environment.stop)
@@ -217,7 +217,7 @@ class HookTests(unittest.TestCase):
         injected = hooks.hook(self.event("PreToolUse", tool_use_id="live", tool_input={
             "code": "await app.click([1, 2]);"}))["hookSpecificOutput"]["updatedInput"]["code"]
         folder = next((self.turn / "captures").iterdir())
-        self.assertIn('await __showandtell.saveTo(' + json.dumps(str(folder.resolve())) + ')', injected)
+        self.assertIn('await __showandtell.saveTo(' + json.dumps(str(folder.resolve())) + ', "reuse")', injected)
         self.assertEqual(folder.stat().st_mode & 0o777, 0o700)
         # Large valid PNG payload models the native result that exceeds transcript limits.
         padding = b"description\x00" + b"x" * 1_100_000
@@ -307,6 +307,24 @@ class HookTests(unittest.TestCase):
             self.collect([image((0, 255, 0))], call="call-2", recorded_at=20)
             hooks.hook(self.event("Stop"))
             self.assertEqual(renderer.render_session.call_count, 2)
+
+    def test_lightweight_defaults_and_explicit_full_capture(self):
+        config = json.loads((ROOT / 'plugins/showandtell/hooks/hooks.json').read_text())['hooks']
+        self.assertTrue(config['Stop'][0]['hooks'][0]['async'])
+        for event in ('PreToolUse', 'PostToolUse', 'SessionStart'):
+            self.assertFalse(config[event][0]['hooks'][0].get('async', False))
+        self.pre('let app = await cua.getApp("Example");')
+        with patch.dict(os.environ, {'SHOWANDTELL_CAPTURE': 'full'}):
+            injected = self.pre('await app.click([1, 2]);')['hookSpecificOutput']['updatedInput']['code']
+        self.assertIn(', "full");', injected)
+        self.collect([{'type': 'text', 'text': marker('action', id='a', type='click', t=1)}])
+        renderer = types.ModuleType('render')
+        renderer.render_session = Mock()
+        with patch.dict(sys.modules, {'render': renderer}):
+            result = hooks.hook(self.event('Stop'))
+        self.assertIn('no screenshot frames', result['systemMessage'])
+        self.assertFalse((self.turn / 'video.mp4').exists())
+        renderer.render_session.assert_not_called()
 
     def test_malformed_hook_stdin_returns_warning_and_success(self):
         for stdin in ("not JSON", "[]"):
