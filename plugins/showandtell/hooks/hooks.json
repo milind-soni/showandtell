@@ -12,7 +12,7 @@
       "hooks": [{"type": "command", "command": "sh \"${PLUGIN_ROOT}/scripts/run.sh\" hook", "timeout": 10}]
     }],
     "Stop": [{
-      "hooks": [{"type": "command", "command": "sh \"${PLUGIN_ROOT}/scripts/run.sh\" hook", "async": true, "timeout": 600}]
+      "hooks": [{"type": "command", "command": "sh \"${PLUGIN_ROOT}/scripts/run.sh\" hook", "timeout": 30}]
     }]
   }
 }

@@ -20,7 +20,8 @@ class InstallTests(unittest.TestCase):
         self.bin = self.root / "bin"
         self.bin.mkdir()
         self.log = self.root / "commands.jsonl"
-        self.env = {**os.environ, "PATH": str(self.bin), "INSTALL_TEST_ROOT": str(self.root)}
+        self.env = {**os.environ, "PATH": str(self.bin), "INSTALL_TEST_ROOT": str(self.root),
+                    "CODEX_HOME": str(self.root / "codex home")}
         self.installer = self.copy_script(ROOT / "install.sh", self.root / "install.sh")
         self.command("uname", 'print("Darwin")')
         self.command("python3", '''
@@ -38,6 +39,8 @@ if args == ["plugin", "marketplace", "list", "--json"]:
     print((root / "marketplaces.json").read_text() if (root / "marketplaces.json").exists() else '{"marketplaces": []}')
 elif args[:3] == ["plugin", "marketplace", "add"]:
     (root / "marketplaces.json").write_text(json.dumps({"marketplaces": [{"name": "showandtell", "marketplaceSource": {"sourceType": "git", "source": "https://github.com/milind-soni/showandtell.git"}}]}))
+elif args == ["plugin", "list", "--marketplace", "showandtell", "--json"]:
+    print((root / "plugins.json").read_text())
 ''')
         for name in ("ffmpeg", "ffprobe"):
             self.command(name, 'sys.exit(1 if (root / "need-ffmpeg").exists() else 0)')
@@ -53,6 +56,18 @@ for package in ("python", "ffmpeg"):
     if package in sys.argv:
         (root / ("need-" + package)).unlink(missing_ok=True)
 ''')
+        self.plugin_root = Path(self.env["CODEX_HOME"]) / "plugins/cache/showandtell/showandtell/0.4.0"
+        (self.plugin_root / "scripts").mkdir(parents=True)
+        (self.plugin_root / "plugin.json").write_text(json.dumps({"name": "showandtell", "version": "0.4.0"}))
+        (self.root / "plugins.json").write_text(json.dumps({"installed": [
+            {"pluginId": "showandtell@showandtell", "installed": True, "version": "0.4.0"}
+        ]}))
+        (self.plugin_root / "scripts/run.sh").write_text(
+            f'#!/bin/sh\nexec "{sys.executable}" "$INSTALL_TEST_ROOT/runtime-check.py" "$@"\n')
+        (self.root / "runtime-check.py").write_text(
+            'import json, os, pathlib, sys\n'
+            'with (pathlib.Path(os.environ["INSTALL_TEST_ROOT"]) / "commands.jsonl").open("a") as stream:\n'
+            '    stream.write(json.dumps(["setup", *sys.argv[1:]]) + "\\n")\n')
 
     def copy_script(self, source, target):
         # Replace both standard Homebrew locations so no host tool can leak into a test.
@@ -65,8 +80,8 @@ for package in ("python", "ffmpeg"):
         path.write_text(f"#!{sys.executable}\nimport json, os, pathlib, sys\nroot = pathlib.Path(os.environ['INSTALL_TEST_ROOT'])\n{code}\n")
         path.chmod(0o755)
 
-    def run_installer(self):
-        return subprocess.run(["/bin/sh", str(self.installer)], env=self.env,
+    def run_installer(self, *args):
+        return subprocess.run(["/bin/sh", str(self.installer), *args], env=self.env,
                               capture_output=True, text=True, timeout=20)
 
     def commands(self):
@@ -140,6 +155,46 @@ for package in ("python", "ffmpeg"):
         args, path = json.loads(result.stdout)
         self.assertEqual(args, ["hook", "value with spaces"])
         self.assertIn(str(brew_bin), path.split(":"))
+
+    def test_claude_install_uses_verified_cache_and_preserves_spaces(self):
+        self.command("claude", 'sys.exit("The installer should only check availability")')
+        result = self.run_installer("--claude")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        commands = self.commands()
+        self.assertIn(["plugin", "add", "showandtell@showandtell"], commands)
+        self.assertIn(["plugin", "list", "--marketplace", "showandtell", "--json"], commands)
+        self.assertEqual(commands[-1], ["setup", "claude-setup", "--install"])
+        self.assertFalse(any("permission" in arg for command in commands for arg in command))
+
+    def test_claude_missing_and_invalid_args_fail_before_mutations(self):
+        for args in [("--claude",), ("--unknown",), ("--claude", "--claude")]:
+            result = self.run_installer(*args)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(self.log.exists())
+        self.assertIn("Usage:", result.stderr)
+        result = self.run_installer("--claude")
+        self.assertIn("Install Claude Code first", result.stderr)
+
+    def test_claude_rejects_invalid_cache_metadata(self):
+        self.command("claude", "sys.exit(0)")
+        (self.plugin_root / "plugin.json").write_text(json.dumps({"name": "elsewhere", "version": "0.4.0"}))
+        result = self.run_installer("--claude")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("runtime is incomplete", result.stderr)
+        self.assertFalse(any(command[0] == "setup" for command in self.commands()))
+        (self.root / "plugins.json").write_text(json.dumps({"installed": [
+            {"pluginId": "showandtell@showandtell", "installed": True, "version": "../elsewhere"}
+        ]}))
+        result = self.run_installer("--claude")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("version is invalid", result.stderr)
+
+    def test_claude_setup_failure_is_actionable(self):
+        self.command("claude", "sys.exit(0)")
+        (self.plugin_root / "scripts/run.sh").write_text("#!/bin/sh\nexit 1\n")
+        result = self.run_installer("--claude")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Claude setup failed", result.stderr)
 
 
 if __name__ == "__main__":

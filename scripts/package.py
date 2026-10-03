@@ -10,7 +10,7 @@ plugin = root / 'plugins/showandtell'
 manifest = json.loads((plugin / '.codex-plugin/plugin.json').read_text())
 output = root / 'dist' / ('showandtell-' + manifest['version'] + '.zip')
 output.parent.mkdir(exist_ok=True)
-files = [plugin / '.codex-plugin/plugin.json']
+files = [plugin / 'plugin.json', plugin / '.codex-plugin/plugin.json']
 for folder in ('hooks', 'scripts', 'skills', 'assets'):
     files.extend(p for p in (plugin / folder).rglob('*')
                  if p.is_file() and '__pycache__' not in p.parts and p.suffix != '.pyc')
@@ -22,6 +22,7 @@ with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
 with zipfile.ZipFile(output) as archive:
     assert archive.testzip() is None
     assert '.codex-plugin/plugin.json' in archive.namelist()
+    assert json.loads(archive.read('plugin.json'))['version'] == manifest['version']
 digest = hashlib.sha256(output.read_bytes()).hexdigest()
 output.with_suffix('.zip.sha256').write_text(f'{digest}  {output.name}\n')
 print(output)

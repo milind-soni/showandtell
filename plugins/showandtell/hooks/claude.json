@@ -1,0 +1,84 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "SHOWANDTELL_CLIENT=claude sh \"$SHOWANDTELL_ROOT/scripts/run.sh\" hook",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "SHOWANDTELL_CLIENT=claude sh \"$SHOWANDTELL_ROOT/scripts/run.sh\" hook",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "^mcp__codex-cu__js$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "SHOWANDTELL_CLIENT=claude sh \"$SHOWANDTELL_ROOT/scripts/run.sh\" hook",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "^mcp__codex-cu__js(_reset)?$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "SHOWANDTELL_CLIENT=claude sh \"$SHOWANDTELL_ROOT/scripts/run.sh\" hook",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "^mcp__codex-cu__js(_reset)?$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "SHOWANDTELL_CLIENT=claude sh \"$SHOWANDTELL_ROOT/scripts/run.sh\" hook",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "SHOWANDTELL_CLIENT=claude sh \"$SHOWANDTELL_ROOT/scripts/run.sh\" hook",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "SHOWANDTELL_CLIENT=claude sh \"$SHOWANDTELL_ROOT/scripts/run.sh\" hook",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

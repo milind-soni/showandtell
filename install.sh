@@ -3,9 +3,16 @@
 set -eu
 
 fail() { printf 'Showandtell: %s\n' "$*" >&2; exit 1; }
+showandtell_install_claude=false
+case "$#" in
+    0) ;;
+    1) [ "$1" = --claude ] || fail 'Usage: install.sh [--claude]'; showandtell_install_claude=true ;;
+    *) fail 'Usage: install.sh [--claude]' ;;
+esac
 [ "$(uname -s)" = Darwin ] || fail 'This installer supports macOS. See README.md for manual installation.'
 PATH="$PATH:/opt/homebrew/bin:/usr/local/bin"
 export PATH
+[ "$showandtell_install_claude" = false ] || command -v claude >/dev/null 2>&1 || fail 'Install Claude Code first (https://code.claude.com/docs/en/setup), then rerun with --claude.'
 
 install_with_brew() {
     command -v brew >/dev/null 2>&1 || fail 'Install the missing prerequisites with Homebrew (https://brew.sh), then rerun this installer. Required: Codex CLI, Python 3.10+, FFmpeg.'
@@ -56,8 +63,34 @@ case "$source_kind" in
 esac
 codex plugin add showandtell@showandtell
 
+if [ "$showandtell_install_claude" = true ]; then
+    installed_plugins=$(codex plugin list --marketplace showandtell --json) || fail 'Could not locate the installed Showandtell plugin.'
+    showandtell_plugin_root=$(printf '%s\n' "$installed_plugins" | "$showandtell_python" -c '
+import json, os, re, sys
+from pathlib import Path
+matches = [p for p in json.load(sys.stdin)["installed"]
+           if p.get("pluginId") == "showandtell@showandtell" and p.get("installed") is True]
+if len(matches) != 1:
+    sys.exit("Expected one installed Showandtell plugin. Run codex plugin list --marketplace showandtell --json to inspect it.")
+version = matches[0].get("version")
+if not isinstance(version, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", version):
+    sys.exit("The installed Showandtell version is invalid.")
+codex_home = Path(os.environ.get("CODEX_HOME") or str(Path.home() / ".codex")).expanduser()
+root = codex_home / "plugins/cache/showandtell/showandtell" / version
+manifest = root / "plugin.json"
+if not manifest.is_file():
+    manifest = root / ".codex-plugin/plugin.json"
+metadata = json.loads(manifest.read_text())
+if metadata.get("name") != "showandtell" or metadata.get("version") != version or not (root / "scripts/run.sh").is_file():
+    sys.exit("The installed Showandtell runtime is incomplete. Reinstall the plugin and retry.")
+print(root.resolve())
+') || fail 'Could not find a complete Showandtell runtime in the Codex plugin cache. Update Codex CLI and retry.'
+    /bin/sh "$showandtell_plugin_root/scripts/run.sh" claude-setup --install || fail 'Claude setup failed. Fix the error above and rerun with --claude.'
+fi
+
 printf '\n%s\n' 'Showandtell is installed.' \
     'Open a new Codex chat, run /hooks, and review and enable the Showandtell hooks.' \
     'Hook trust is required; this installer does not grant it.' \
     'Then ask: Use Showandtell to make a video of this walkthrough.' \
     'Videos are saved in ~/.showandtell/.'
+[ "$showandtell_install_claude" = false ] || printf '%s\n' 'Claude Code is configured too. Start a new session to use codex-cu and Showandtell.'

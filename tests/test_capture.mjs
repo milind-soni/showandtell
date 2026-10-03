@@ -33,7 +33,7 @@ function fixture(overrides = {}) {
   return { events, writes, calls, screenshots, target, context, cua };
 }
 
-test("default action preserves receiver/options/result and takes zero extra screenshots", async () => {
+test("unconfigured helper preserves receiver/options/result without extra screenshots", async () => {
   const f = fixture();
   const app = await f.cua.getApp("Example");
   const options = { clickCount: 2 };
@@ -87,7 +87,8 @@ test("fresh call scopes reuse one recorder without nested capture", async () => 
 
 test("older recorder registry cannot suppress the direct capture API", async () => {
   const old = { wrap(value) { return value; } };
-  const context = vm.createContext({ __showandtellCaptureV1: old, __showandtellCaptureV2: old, cua: {}, nodeRepl: { write() {} } });
+  const context = vm.createContext({ __showandtellCaptureV1: old, __showandtellCaptureV2: old,
+    __showandtellCaptureV4: old, __showandtellCaptureV5: old, cua: {}, nodeRepl: { write() {} } });
   vm.runInContext(source, context);
   assert.equal(context.__showandtellCaptureV1, old);
   assert.notEqual(context.__showandtell, old);
@@ -279,7 +280,7 @@ test("direct capture saves large bytes privately without tool-result images and 
     for (const call of ["full", "reuse"]) {
       const folder = join(directory, call);
       await mkdir(folder);
-      await recorder.saveTo(folder, call === "full" ? "full" : undefined);
+      await recorder.saveTo(folder, call);
       const handle = await api.getApp();
       if (call === "reuse") assert.equal(await handle.getScreenshot({ emit: false }), bytes);
       assert.equal(await handle.click([10, 20]), 42);
@@ -296,8 +297,16 @@ test("direct capture saves large bytes privately without tool-result images and 
         assert.deepEqual(new Uint8Array(await readFile(join(folder, entry.image))), new Uint8Array(bytes));
         assert.equal((await stat(join(folder, entry.image))).mode & 0o777, 0o600);
       }
+      if (call === "reuse") {
+        // A permission retry can repeat PreToolUse for the same tool call.
+        await recorder.saveTo(folder, "reuse");
+        assert.equal(await handle.click([30, 40]), 42);
+        const appended = (await readFile(join(folder, "events.jsonl"), "utf8")).trim().split("\n").map(JSON.parse);
+        assert.equal(appended.filter((event) => event.kind === "action").length, 2);
+        assert.equal(appended.at(-1).status, "ok");
+      }
     }
-    assert.equal(clicks, 2);
+    assert.equal(clicks, 3);
     assert.equal(screenshots, 4);
     assert.deepEqual(writes, []);
     const failedFolder = join(directory, "failed");
@@ -317,7 +326,176 @@ test("direct capture saves large bytes privately without tool-result images and 
     assert.equal(await (await api.getApp()).click([1, 2]), 42);
     assert.ok(writes.some((value) => value.includes("capture-storage-unavailable")));
   } finally {
-    delete globalThis.__showandtellCaptureV3;
+    delete globalThis.__showandtellCaptureV6;
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("default actions capture every intermediate state and reuse an observed baseline", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "showandtell-actions-"));
+  const outputs = [];
+  let shots = 0;
+  const app = {
+    state: 9,
+    async getScreenshot(options) {
+      assert.equal(this, app);
+      assert.equal(options.emit, false);
+      shots++;
+      return new Uint8Array([this.state]);
+    },
+    async click(point, options) {
+      assert.equal(this, app);
+      assert.equal(options, privateOptions);
+      this.state = point[0];
+      return this.state;
+    },
+  };
+  const privateOptions = { text: "private option" };
+  const observed = {
+    state: 40,
+    async getScreenshot() { shots++; return new Uint8Array([this.state]); },
+    async click() { this.state++; return this.state; },
+  };
+  const api = { async getApp(name) { return name === "observed" ? observed : app; } };
+  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+  try {
+    const recorder = await new AsyncFunction("cua", "nodeRepl", source + "\nreturn __showandtell;")(
+      api, { write(value) { outputs.push(value); }, emitImage() { assert.fail("No duplicate tool images"); } });
+    const folder = join(directory, "batch");
+    await mkdir(folder);
+    await recorder.saveTo(folder); // Public default must preserve the AC state inside a batch.
+    const handle = await api.getApp("calculator");
+    for (let state = 0; state < 7; state++) assert.equal(await handle.click([state, 2], privateOptions), state);
+    const entries = (await readFile(join(folder, "events.jsonl"), "utf8")).trim().split("\n").map(JSON.parse);
+    const frames = entries.filter((entry) => entry.kind === "frame");
+    assert.equal(shots, 8);
+    assert.equal(frames.filter((entry) => entry.phase === "before").length, 1);
+    assert.equal(frames.filter((entry) => entry.phase === "after").length, 7);
+    assert.deepEqual(await Promise.all(frames.map(async (entry) => (await readFile(join(folder, entry.image)))[0])),
+      [9, 0, 1, 2, 3, 4, 5, 6]);
+    for (const action of entries.filter((entry) => entry.kind === "action")) {
+      assert.ok(entries.find((entry) => entry.kind === "frame" && entry.phase === "after" && entry.id === action.id));
+      assert.equal(entries.find((entry) => entry.kind === "status" && entry.id === action.id).status, "ok");
+    }
+    assert.equal(JSON.stringify(entries).includes(privateOptions.text), false);
+    const other = await api.getApp("observed");
+    await other.getScreenshot({ emit: false });
+    const before = shots;
+    assert.equal(await other.click([1, 2]), 41);
+    assert.equal(shots - before, 1); // Its ordinary observation replaces the extra baseline.
+    const expected = new Error("private click failure");
+    observed.click = async function () { this.state = 42; throw expected; };
+    await assert.rejects(other.click([1, 2]), (error) => error === expected);
+    const final = (await readFile(join(folder, "events.jsonl"), "utf8")).trim().split("\n").map(JSON.parse);
+    assert.equal(final.at(-1).status, "failed");
+    assert.equal(final.at(-2).phase, "after");
+    assert.equal((await readFile(join(folder, final.at(-2).image)))[0], 42);
+    assert.equal(JSON.stringify(final).includes(expected.message), false);
+    assert.deepEqual(outputs, []);
+    const sameTurn = join(directory, "next-call");
+    await mkdir(sameTurn);
+    await recorder.saveTo(sameTurn);
+    const sameTurnShots = shots;
+    await handle.click([7, 2], privateOptions);
+    assert.equal(shots - sameTurnShots, 1);
+    const nextTurn = join(directory, "next-turn", "call");
+    await mkdir(nextTurn, { recursive: true });
+    await recorder.saveTo(nextTurn);
+    const nextTurnShots = shots;
+    await handle.click([8, 2], privateOptions);
+    assert.equal(shots - nextTurnShots, 2); // Previous turn's images are not in this video.
+  } finally {
+    delete globalThis.__showandtellCaptureV6;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("private Mac screenshots cannot consume the caller's next AX update", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "showandtell-ax-"));
+  const expected = new Error("private AX error");
+  const axCalls = [];
+  const options = { emit: false, disableDiffing: false, detail: "preserved" };
+  const extra = { unchanged: true };
+  let shots = 0;
+  let failScreenshot = false;
+  let failAX = false;
+  const app = {
+    state: 9, previous: null,
+    async getScreenshot(value) {
+      assert.equal(value.emit, false);
+      shots++;
+      this.previous = this.state; // Mac's screenshot RPC advances the AX cache too.
+      if (failScreenshot) throw new Error("private screenshot error");
+      return new Uint8Array([this.state]);
+    },
+    async getAXState(value, other) {
+      axCalls.push({ value, other });
+      if (failAX) { failAX = false; throw expected; }
+      const result = value?.disableDiffing || this.previous !== this.state ? `Display ${this.state}` : "no change";
+      this.previous = this.state;
+      return result;
+    },
+    async getAXStateAndScreenshot(value, other) {
+      return { state: await this.getAXState(value, other), screenshot: await this.getScreenshot(value) };
+    },
+    async click(point) { this.state = point[0]; return this.state; },
+  };
+  const api = { computer: { target: "mac" }, async getApp() { return app; } };
+  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+  try {
+    const recorder = await new AsyncFunction("cua", "nodeRepl", source + "\nreturn __showandtell;")(
+      api, { write() {}, emitImage() { assert.fail("No duplicate images"); } });
+    await recorder.saveTo(directory);
+    const handle = await api.getApp();
+    assert.equal(await handle.getAXState(options, extra), "Display 9");
+    assert.equal(axCalls.at(-1).value, options); // Clean observations keep their original options object.
+    await handle.click([0, 0]);
+    assert.equal(shots, 2);
+    assert.equal(await handle.getAXState(options, extra), "Display 0");
+    assert.deepEqual(axCalls.at(-1).value, { ...options, disableDiffing: true });
+    assert.equal(axCalls.at(-1).other, extra);
+    assert.equal(options.disableDiffing, false);
+    assert.equal(shots, 2); // AX stays an AX call: no combined RPC or additional screenshot.
+    assert.equal(await handle.getAXState(options, extra), "no change");
+    assert.equal(axCalls.at(-1).value, options);
+    failScreenshot = true;
+    await handle.click([1, 0]);
+    failAX = true;
+    await assert.rejects(handle.getAXState(options, extra), (error) => error === expected);
+    assert.equal(await handle.getAXState(options, extra), "Display 1"); // Failed AX did not clear the flag.
+    assert.equal(axCalls.at(-1).value.disableDiffing, true);
+    failScreenshot = false;
+    await handle.getScreenshot(options);
+    const combined = await handle.getAXStateAndScreenshot(options, extra);
+    assert.equal(combined.state, "Display 1");
+    assert.deepEqual(combined.screenshot, new Uint8Array([1]));
+    assert.equal(axCalls.at(-1).value.emit, false);
+    assert.equal(axCalls.at(-1).value.disableDiffing, true);
+    assert.equal(axCalls.at(-1).other, extra);
+    await handle.getAXState(options, extra);
+    assert.equal(axCalls.at(-1).value, options);
+    const saved = await readFile(join(directory, "events.jsonl"), "utf8");
+    assert.equal(saved.includes("Display"), false);
+    assert.equal(saved.includes(expected.message), false);
+    assert.equal(saved.includes("preserved"), false);
+  } finally {
+    delete globalThis.__showandtellCaptureV6;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Mac AX refresh override never touches browsers or non-Mac native handles", async () => {
+  const options = { emit: false };
+  const f = fixture({ async getAXState(value) { assert.equal(value, options); return "AX state"; } });
+  f.cua.computer = { target: "mac" };
+  const browser = f.context.__showandtell.wrap(f.target, "browser");
+  await browser.getScreenshot(options);
+  await browser.getAXState(options);
+  for (const target of ["windows", "linux"]) {
+    const native = fixture({ async getAXState(value) { assert.equal(value, options); return "AX state"; } });
+    native.cua.computer = { target };
+    const app = await native.cua.getApp();
+    await app.getScreenshot(options);
+    await app.getAXState(options);
   }
 });

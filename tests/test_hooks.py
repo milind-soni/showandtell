@@ -8,6 +8,8 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import types
 import unittest
 from unittest.mock import Mock, patch
@@ -47,9 +49,13 @@ class HookTests(unittest.TestCase):
         self.home = Path(self.temp.name)
         self.environment = patch.dict(os.environ, {
             "SHOWANDTELL_HOME": str(self.home), "SHOWANDTELL_DISABLED": "0", "SHOWANDTELL_CAPTURE": "reuse",
+            "SHOWANDTELL_CLIENT": "codex",
         })
         self.environment.start()
         self.addCleanup(self.environment.stop)
+        self.spawn_patch = patch.object(hooks.subprocess, 'Popen')
+        self.spawn = self.spawn_patch.start()
+        self.addCleanup(self.spawn_patch.stop)
         self.turn = self.home / "session-1" / "turn-1"
 
     def event(self, kind, **values):
@@ -289,7 +295,7 @@ class HookTests(unittest.TestCase):
         saved = json.loads((self.turn / "session.json").read_text())
         self.assertEqual([a["id"] for a in saved["actions"]], ["one", "two"])
 
-    def test_stop_renders_once_per_manifest_and_uses_the_turn_id(self):
+    def test_stop_queues_pinned_turn_then_worker_renders_once_per_manifest(self):
         self.collect([image()], recorded_at=10)
         renderer = types.ModuleType("render")
 
@@ -302,21 +308,37 @@ class HookTests(unittest.TestCase):
         with patch.dict(sys.modules, {"render": renderer}):
             first = hooks.hook(self.event("Stop"))
             self.assertIn(str(self.turn / "video.mp4"), first["systemMessage"])
+            self.assertIn('queued', first['systemMessage'])
+            self.assertEqual(self.spawn.call_args.args[0][-2:], ['export', str(self.turn)])
+            self.assertTrue(self.spawn.call_args.kwargs['start_new_session'])
+            self.assertEqual(self.spawn.call_args.kwargs['stdin'], subprocess.DEVNULL)
+            renderer.render_session.assert_not_called()
+            hooks.export_turn(self.turn)
             self.assertEqual(hooks.hook(self.event("Stop", stop_hook_active=True)), {})
             renderer.render_session.assert_called_once()
             self.collect([image((0, 255, 0))], call="call-2", recorded_at=20)
             hooks.hook(self.event("Stop"))
+            hooks.export_turn(self.turn)
             self.assertEqual(renderer.render_session.call_count, 2)
 
-    def test_lightweight_defaults_and_explicit_full_capture(self):
+    def test_capture_modes_and_synchronous_queue_hook(self):
         config = json.loads((ROOT / 'plugins/showandtell/hooks/hooks.json').read_text())['hooks']
-        self.assertTrue(config['Stop'][0]['hooks'][0]['async'])
+        self.assertFalse(config['Stop'][0]['hooks'][0].get('async', False))
         for event in ('PreToolUse', 'PostToolUse', 'SessionStart'):
             self.assertFalse(config[event][0]['hooks'][0].get('async', False))
         self.pre('let app = await cua.getApp("Example");')
         with patch.dict(os.environ, {'SHOWANDTELL_CAPTURE': 'full'}):
             injected = self.pre('await app.click([1, 2]);')['hookSpecificOutput']['updatedInput']['code']
         self.assertIn(', "full");', injected)
+        self.assertIn(', "reuse");', self.pre('await app.click([1, 2]);')['hookSpecificOutput']['updatedInput']['code'])
+        for mode in (None, 'actions', 'invalid'):
+            with patch.dict(os.environ):
+                if mode is None:
+                    os.environ.pop('SHOWANDTELL_CAPTURE', None)
+                else:
+                    os.environ['SHOWANDTELL_CAPTURE'] = mode
+                injected = self.pre('await app.click([1, 2]);')['hookSpecificOutput']['updatedInput']['code']
+            self.assertIn(', "actions");', injected)
         self.collect([{'type': 'text', 'text': marker('action', id='a', type='click', t=1)}])
         renderer = types.ModuleType('render')
         renderer.render_session = Mock()
@@ -327,12 +349,162 @@ class HookTests(unittest.TestCase):
         renderer.render_session.assert_not_called()
 
     def test_malformed_hook_stdin_returns_warning_and_success(self):
+        self.spawn_patch.stop()
         for stdin in ("not JSON", "[]"):
             with self.subTest(stdin=stdin):
                 result = subprocess.run([sys.executable, str(SCRIPT), "hook"], input=stdin,
                                         text=True, capture_output=True, check=False)
                 self.assertEqual(result.returncode, 0)
                 self.assertTrue(json.loads(result.stdout)["systemMessage"].startswith("Showandtell:"))
+
+    def claude_event(self, kind, **values):
+        return {'hook_event_name': kind, 'session_id': 'session-1',
+                'tool_name': 'mcp__codex-cu__js', **values}
+
+    def test_claude_prompt_turns_keep_bindings_and_normal_approval(self):
+        with patch.dict(os.environ, {'SHOWANDTELL_CLIENT': 'claude'}):
+            self.assertEqual(hooks.hook(self.claude_event('SessionStart')), {})
+            hooks.hook(self.claude_event('UserPromptSubmit'))
+            runtime_path = self.home / 'claude-session-1/runtime.json'
+            first = json.loads(runtime_path.read_text())['current_turn']
+            self.assertRegex(first, r'^[0-9a-f]{32}$')
+            hooks.hook(self.claude_event('PreToolUse', tool_input={'code': 'let app = await cua.getApp("Example");'}))
+            hooks.hook(self.claude_event('UserPromptSubmit'))
+            runtime = json.loads(runtime_path.read_text())
+            self.assertNotEqual(first, runtime['current_turn'])
+            self.assertTrue(runtime['seen'])
+            self.assertIn('app', runtime['bindings'])
+            args = {'code': 'await app.click([1, 2]);', 'timeout_ms': 5000}
+            event = self.claude_event('PreToolUse', tool_use_id='retry', tool_input=args)
+            first_output = hooks.hook(event)['hookSpecificOutput']
+            second_output = hooks.hook(event)['hookSpecificOutput']
+            self.assertEqual(first_output, second_output)
+            self.assertNotIn('permissionDecision', first_output)
+            self.assertEqual(first_output['updatedInput']['timeout_ms'], 5000)
+            self.assertIn('__showandtell.wrap(app, "app")', first_output['updatedInput']['code'])
+            turn = self.home / 'claude-session-1' / runtime['current_turn']
+            self.assertEqual(len(list((turn / 'captures').iterdir())), 1)
+            hooks.hook(self.claude_event('PostToolUse', tool_name='mcp__codex-cu__js_reset'))
+            reset = json.loads(runtime_path.read_text())
+            self.assertEqual(reset, {'seen': False, 'bindings': {}, 'current_turn': runtime['current_turn']})
+            hooks.hook(self.claude_event('SessionStart'))
+            self.assertEqual(json.loads(runtime_path.read_text()), {'seen': False, 'bindings': {}})
+            self.assertFalse((self.home / 'session-1').exists())
+            self.assertEqual(hooks.hook(self.claude_event('PreToolUse', session_id=None, tool_input=args)), {})
+            self.assertFalse((self.home / 'claude-unknown').exists())
+
+    def test_claude_exact_alias_lazy_turn_and_failure_collection(self):
+        with patch.dict(os.environ, {'SHOWANDTELL_CLIENT': 'claude'}):
+            hooks.hook(self.claude_event('PreToolUse', tool_input={'code': 'await cua.getState();'}))
+            runtime = json.loads((self.home / 'claude-session-1/runtime.json').read_text())
+            turn = self.home / 'claude-session-1' / runtime['current_turn']
+            args = {'code': 'await app.click([1, 2]);'}
+            for name in ('mcp__other_codex-cu__js', 'mcp__codex-cu__js_extra', 'mcp__codex-cu.js'):
+                self.assertEqual(hooks.hook(self.claude_event('PreToolUse', tool_name=name, tool_input=args)), {})
+            hooks.hook(self.claude_event('PreToolUse', tool_use_id='failed', tool_input=args))
+            folder = turn / 'captures' / hooks.capture_id('failed')
+            (folder / 'events.jsonl').write_text(marker('action', id='a', type='click', t=1))
+            hooks.hook(self.claude_event('PostToolUseFailure', tool_use_id='failed',
+                                       tool_response={'content': [image()]}, error='private error'))
+            captured = json.loads((turn / 'session.json').read_text())
+            self.assertEqual(len(captured['actions']), 1)
+            self.assertEqual(captured['frames'], [])
+            self.assertNotIn('private error', json.dumps(captured))
+            hooks.hook(self.claude_event('PostToolUseFailure', tool_use_id='empty', tool_response={'content': [image()]}))
+            self.assertEqual(json.loads((turn / 'session.json').read_text()), captured)
+
+    def test_claude_session_end_queues_every_pending_turn_and_config_is_scoped(self):
+        with patch.dict(os.environ, {'SHOWANDTELL_CLIENT': 'claude'}):
+            turns = []
+            for index in range(2):
+                hooks.hook(self.claude_event('UserPromptSubmit'))
+                runtime = json.loads((self.home / 'claude-session-1/runtime.json').read_text())
+                turn = self.home / 'claude-session-1' / runtime['current_turn']
+                turns.append(turn)
+                folder = turn / 'captures' / hooks.capture_id(str(index))
+                folder.mkdir(parents=True)
+                (folder / 'frame.img').write_bytes(png())
+                (folder / 'events.jsonl').write_text(marker('frame', id=str(index), phase='observed', t=index, image='frame.img'))
+            result = hooks.hook(self.claude_event('SessionEnd'))
+            self.assertEqual(self.spawn.call_count, 2)
+            self.assertEqual({Path(call.args[0][-1]) for call in self.spawn.call_args_list}, set(turns))
+            self.assertEqual(result['systemMessage'].count('queued'), 2)
+            for turn in turns:
+                self.assertEqual(json.loads((turn / 'export.json').read_text())['status'], 'queued')
+        config = json.loads((ROOT / 'plugins/showandtell/hooks/claude.json').read_text())
+        self.assertEqual(set(config), {'hooks'})
+        for event, entries in config['hooks'].items():
+            entry = entries[0]
+            command = entry['hooks'][0]
+            self.assertIn('SHOWANDTELL_CLIENT=claude', command['command'])
+            self.assertIn('$SHOWANDTELL_ROOT/scripts/run.sh', command['command'])
+            self.assertFalse(command.get('async', False))
+            if event in ('PreToolUse', 'PostToolUse', 'PostToolUseFailure'):
+                self.assertTrue(entry['matcher'].startswith('^mcp__codex-cu__js'))
+
+    def test_background_export_status_errors_and_busy_renderer_do_not_block_stop(self):
+        self.collect([image()], recorded_at=10)
+        started, finish = threading.Event(), threading.Event()
+        renderer = types.ModuleType('render')
+
+        def slow_render(directory, destination):
+            started.set()
+            if not finish.wait(3):
+                raise RuntimeError('test renderer timed out')
+            destination.write_bytes(b'video')
+            return {'output': str(destination)}
+
+        renderer.render_session = Mock(side_effect=slow_render)
+        with patch.dict(sys.modules, {'render': renderer}):
+            hooks.hook(self.event('Stop'))
+            pinned = self.spawn.call_args.args[0][-1]
+            worker = threading.Thread(target=hooks.export_turn, args=(self.turn,))
+            worker.start()
+            try:
+                self.assertTrue(started.wait(1))
+                before = time.monotonic()
+                self.assertEqual(hooks.export_status(self.turn)['status'], 'rendering')
+                hooks.hook(self.event('Stop'))
+                self.assertLess(time.monotonic() - before, 0.5)
+                self.assertEqual(self.spawn.call_args.args[0][-1], pinned)
+                self.assertNotIn('video', hooks.export_status(self.turn))
+            finally:
+                finish.set()
+                worker.join(3)
+            self.assertEqual(hooks.export_status(self.turn)['status'], 'ready')
+            self.assertEqual(hooks.export_status(self.turn)['video'], str(self.turn / 'video.mp4'))
+            renderer.render_session.side_effect = RuntimeError('encoder failed\n' + 'x' * 300)
+            self.collect([image((0, 255, 0))], call='new', recorded_at=20)
+            self.assertNotIn('video', hooks.export_status(self.turn))
+            hooks.export_turn(self.turn)
+            status = hooks.export_status(self.turn)
+            self.assertEqual(status['status'], 'error')
+            self.assertLessEqual(len(status['error']), 250)
+            self.assertNotIn('\n', status['error'])
+            self.assertNotIn('video', status)
+
+    def test_status_finds_latest_capture_and_ignores_symlink_directories(self):
+        self.assertEqual(hooks.export_status()['status'], 'empty')
+        self.collect([image()])
+        (self.home / 'loop').symlink_to(self.home, target_is_directory=True)
+        result = hooks.export_status()
+        self.assertEqual(result['directory'], str(self.turn))
+        self.assertEqual((result['actions'], result['frames']), (0, 1))
+        self.assertEqual(result['status'], 'not-exported')
+        self.assertNotIn('video', result)
+
+    def test_export_cli_reports_failure_and_preserves_existing_video(self):
+        self.spawn_patch.stop()
+        self.turn.mkdir(parents=True)
+        (self.turn / 'session.json').write_text(json.dumps({'frames': [{'file': '../outside.png', 't': 1}], 'actions': []}))
+        video = self.turn / 'video.mp4'
+        video.write_bytes(b'previous video')
+        result = subprocess.run([sys.executable, '-S', str(SCRIPT), 'export', str(self.turn)],
+                                text=True, capture_output=True, timeout=20)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn('export failed', json.loads(result.stdout)['systemMessage'])
+        self.assertEqual(video.read_bytes(), b'previous video')
+        self.assertEqual(hooks.export_status(self.turn)['status'], 'error')
 
 
 if __name__ == "__main__":

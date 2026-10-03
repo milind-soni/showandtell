@@ -1,6 +1,6 @@
 // Inject only after CUA's first discovery call. This uses public CUA methods only.
 // CUA evaluates calls in fresh scopes, so a local var cannot guard reinjection.
-var __showandtell = globalThis.__showandtellCaptureV3 ||= (() => {
+var __showandtell = globalThis.__showandtellCaptureV6 ||= (() => {
     const actions = new Set([
       "click", "drag", "scroll", "typeText", "paste", "pressKey", "setValue",
       "selectText", "performSecondaryAction", "goto", "back", "forward", "reload",
@@ -10,7 +10,7 @@ var __showandtell = globalThis.__showandtellCaptureV3 ||= (() => {
       performSecondaryAction: "secondary", goto: "navigate", back: "navigate",
       forward: "navigate", reload: "navigate",
     };
-    const observations = new Set(["getScreenshot", "getAXStateAndScreenshot"]);
+    const observations = new Set(["getScreenshot", "getAXState", "getAXStateAndScreenshot"]);
     const proxies = new WeakMap();
     const surfaces = new WeakMap();
     const wrappedMethods = new WeakSet();
@@ -18,21 +18,28 @@ var __showandtell = globalThis.__showandtellCaptureV3 ||= (() => {
     const creatorWarnings = new Set();
     const warned = new WeakSet();
     const originals = new WeakMap();
+    const photographed = new Set();
+    const needsFullAX = new Set();
     let sequence = 0;
     let surfaceSequence = 0;
     let output = Promise.resolve();
     let destination = null;
+    let captureFolder = null;
     let mode = "reuse";
     let lastTime = 0;
     const timestamp = () => (lastTime = Math.max(Date.now() / 1000, lastTime + 0.000001));
-    const saveTo = async (directory, captureMode = "reuse") => {
+    const saveTo = async (directory, captureMode = "actions") => {
       await output;
       try { await destination?.file?.close(); } catch (_) {}
-      mode = captureMode === "full" ? "full" : "reuse";
+      const folder = directory.slice(0, directory.lastIndexOf("/"));
+      if (captureFolder !== folder) photographed.clear();
+      captureFolder = folder;
+      mode = ["reuse", "actions", "full"].includes(captureMode) ? captureMode : "actions";
       destination = { directory };
       try {
         const fs = await import("node:fs/promises");
-        destination = { directory, fs, file: await fs.open(directory + "/events.jsonl", "wx", 0o600) };
+        destination = { directory, fs, file: await fs.open(directory + "/events.jsonl",
+          fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | fs.constants.O_NOFOLLOW, 0o600) };
       } catch (_) {
         try { await nodeRepl.write(JSON.stringify({ showandtell: 1, kind: "warning",
           reason: "capture-storage-unavailable" }) + "\n"); } catch (_) {}
@@ -81,12 +88,14 @@ var __showandtell = globalThis.__showandtellCaptureV3 ||= (() => {
       return output;
     };
     const frame = async (target, event, phase) => {
+      if (event.surface.startsWith("app:") && cua.computer?.target === "mac") needsFullAX.add(event.surface);
       try {
         const method = target.getScreenshot;
         const screenshot = await Reflect.apply(originals.get(method) ?? method, target, [{ emit: false }]);
         const image = imageBytes(screenshot);
         if (image?.length) {
           await emit({ ...event, kind: "frame", phase }, image);
+          photographed.add(event.surface);
           return;
         }
       } catch (_) { /* Capture must never prevent the requested action. */ }
@@ -94,17 +103,29 @@ var __showandtell = globalThis.__showandtellCaptureV3 ||= (() => {
         reason: "screenshot-unavailable" });
     };
     const observe = async (target, method, type, args, surface) => {
+      const native = surface.startsWith("app:") && cua.computer?.target === "mac";
+      const ax = type === "getAXState" || type === "getAXStateAndScreenshot";
+      // Native Mac screenshots advance the AX diff even when their image is private.
+      if (native && type === "getScreenshot") needsFullAX.add(surface);
+      if (native && ax && needsFullAX.has(surface)) {
+        args = [{ ...args[0], disableDiffing: true }, ...args.slice(1)];
+      }
       const result = await Reflect.apply(method, target, args);
+      if (native && ax) needsFullAX.delete(surface);
       const image = imageBytes(type === "getScreenshot" ? result : result?.screenshot);
       // Nested public observations may repeat a frame; the collector deduplicates its bytes.
-      if (image) await emit({ id: `std-${Date.now()}-${++sequence}`, surface,
-        kind: "frame", phase: "observed" }, image, false);
+      if (image) {
+        await emit({ id: `std-${Date.now()}-${++sequence}`, surface,
+          kind: "frame", phase: "observed" }, image, false);
+        photographed.add(surface);
+      }
       return result;
     };
     const run = async (target, method, type, args, surface) => {
       const event = { id: `std-${Date.now()}-${++sequence}`, surface };
       const full = mode === "full";
-      if (full) await frame(target, event, "before");
+      const after = mode !== "reuse";
+      if (full || (after && !photographed.has(surface))) await frame(target, event, "before");
       const from = point(args[0]);
       const details = { x: from?.[0] ?? null, y: from?.[1] ?? null };
       if (type === "drag") details.to = point(args[1]);
@@ -116,7 +137,7 @@ var __showandtell = globalThis.__showandtellCaptureV3 ||= (() => {
         status = "ok";
         return result;
       } finally {
-        if (full) await frame(target, event, "after");
+        if (after) await frame(target, event, "after");
         await emit({ ...event, kind: "status", status });
       }
     };

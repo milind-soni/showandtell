@@ -1,7 +1,7 @@
 {
   "name": "showandtell",
-  "version": "0.3.0",
-  "description": "Turn Codex computer-use screenshots and actions into local videos with smooth cursor motion.",
+  "version": "0.4.0",
+  "description": "Capture supported computer-use action results as local MP4 walkthroughs.",
   "author": {
     "name": "Milind Soni"
   },
@@ -9,7 +9,7 @@
   "interface": {
     "displayName": "Showandtell",
     "shortDescription": "Computer use becomes a video.",
-    "longDescription": "Turn supported Codex computer-use actions into local MP4 walkthroughs with smooth cursor motion. Reuses normal screenshot observations and renders in the background with FFmpeg. Requires desktop computer use, Python 3.10+, FFmpeg, and trusted command hooks. Text-only observations cannot produce a video.",
+    "longDescription": "Record supported Codex computer-use actions as local MP4 walkthroughs with smooth cursor motion. Captures a screenshot after each action, saves normal observations, and exports in the background. Capture awaits screenshot calls and local writes. Requires Python, FFmpeg, trusted hooks, and local desktop access. The experimental Claude adapter depends on native app consent; its tested external browser backend is unsupported.",
     "developerName": "Milind Soni",
     "category": "Productivity",
     "capabilities": [],
