@@ -1,501 +1,329 @@
 import assert from "node:assert/strict";
-import { readFile, mkdtemp, mkdir, readdir, rm, stat } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import vm from "node:vm";
+import { pathToFileURL } from "node:url";
 import test from "node:test";
 
 const source = await readFile(new URL("../plugins/showandtell/scripts/capture.js", import.meta.url), "utf8");
-function fixture(overrides = {}) {
-  const events = [];
-  const writes = [];
-  const calls = [];
-  const screenshots = [];
-  const target = {
-    value: 7,
-    async getScreenshot(options) {
-      assert.equal(this, target);
-      screenshots.push(options);
-      return new Uint8Array([137, 80, 78, 71]);
-    },
-    async click(...args) { assert.equal(this, target); calls.push(args); return this.value; },
-    async drag(...args) { calls.push(args); },
-    async typeText(...args) { calls.push(args); },
-    async getState() { assert.equal(this, target); return "state"; },
-    ...overrides,
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+const RESOLVED = "/Applications/Example.app";
+
+// Models the bundled Mac engine as REPL code sees it: cua.computer is a
+// read-only proxy over RPC stubs, nodeRepl is frozen, every observation returns
+// AX text plus a short-lived screenshot file, actions return nothing, and AX
+// text is a diff against the previous observation unless disableDiff is set.
+async function engine(root, { target = "mac", tab } = {}) {
+  const shots = join(root, "shots");
+  await mkdir(shots, { recursive: true });
+  const f = { calls: [], writes: [], state: 0, diffBase: null, failShots: false, failClick: null, shotCount: 0 };
+  const skyshot = async (request) => {
+    if (f.failShots) throw new Error("private screenshot failure");
+    const file = join(shots, `shot-${++f.shotCount}.jpg`);
+    await writeFile(file, Buffer.from([0xff, 0xd8, f.state]));
+    const text = request.disableDiff || f.diffBase !== f.state ? `Display ${f.state}` : "no change";
+    f.diffBase = f.state;
+    return { app: RESOLVED, screenshot: { url: pathToFileURL(file).href }, text };
   };
-  const cua = { async getApp() { assert.equal(this, cua); return target; } };
-  const context = vm.createContext({ cua, nodeRepl: {
-    write(value) { writes.push(value); events.push(JSON.parse(value)); },
-    emitImage(value) { events.push({ kind: "image", value }); },
-  } });
-  vm.runInContext(source, context);
-  return { events, writes, calls, screenshots, target, context, cua };
+  const stubs = {
+    target,
+    async get_app_state(request) { f.calls.push(["get_app_state", request]); return skyshot(request); },
+    async click(request) { f.calls.push(["click", request]); if (f.failClick) throw f.failClick; f.state = request.x ?? f.state; },
+    async drag(request) { f.calls.push(["drag", request]); },
+    async type_text(request) { f.calls.push(["type_text", request]); },
+    async press_key(request) { f.calls.push(["press_key", request]); },
+    async scroll(request) { f.calls.push(["scroll", request]); },
+  };
+  const proxyTarget = {};
+  const computer = new Proxy(proxyTarget, {
+    get(_, name) { const value = Reflect.get(stubs, name); return typeof value === "function" ? value.bind(stubs) : value; },
+    getOwnPropertyDescriptor(_, name) { return Object.getOwnPropertyDescriptor(stubs, name); },
+    has: (_, name) => name in stubs,
+    ownKeys: () => Object.keys(stubs),
+  });
+  // CUA's bound app handle, shaped like bind_mac_app: it calls the shared client.
+  const handle = (app) => ({
+    async getAXState(o) {
+      const text = (await computer.get_app_state({ app, disableDiff: o?.disableDiffing })).text;
+      if (o?.emit !== false) await nodeRepl.write(text, "cua.state");
+      return text;
+    },
+    async getScreenshot(o) {
+      const r = await computer.get_app_state({ app });
+      const bytes = new Uint8Array(await readFile(new URL(r.screenshot.url)));
+      if (o?.emit !== false) await nodeRepl.emitImage(bytes);
+      return bytes;
+    },
+    async getAXStateAndScreenshot(o) {
+      const r = await computer.get_app_state({ app, disableDiff: o?.disableDiffing });
+      return { state: r.text, screenshot: new Uint8Array(await readFile(new URL(r.screenshot.url))) };
+    },
+    async click(p, o) { return computer.click(Array.isArray(p) ? { app, x: p[0], y: p[1], ...o } : { app, element_index: p }); },
+    async typeText(text) { return computer.type_text({ app, text }); },
+    async pressKey(key) { return computer.press_key({ app, key }); },
+    async drag(a, b) { return computer.drag({ app, from_x: a[0], from_y: a[1], to_x: b[0], to_y: b[1] }); },
+  });
+  const cua = {
+    computer,
+    async getApp(name) { const r = await computer.get_app_state({ app: name, disableDiff: true }); return handle(r.app); },
+    ...(tab ? { async getTab() { return tab; } } : {}),
+  };
+  const nodeRepl = Object.freeze({
+    write(value, channel) { f.writes.push([value, channel]); },
+    emitImage(value) { f.writes.push(["image", value.length]); },
+    rpc() { throw new Error("not for REPL code"); },
+  });
+  const recorder = await new AsyncFunction("cua", "nodeRepl", source + "\nreturn __showandtell;")(cua, nodeRepl);
+  const events = async (folder) => (await readFile(join(folder, "events.jsonl"), "utf8")).trim().split("\n").map(JSON.parse);
+  const folder = async (...parts) => { const p = join(root, ...parts); await mkdir(p, { recursive: true }); return p; };
+  return { ...f, f, cua, computer, proxyTarget, stubs, handle, nodeRepl, recorder, events, folder, source };
 }
 
-test("unconfigured helper preserves receiver/options/result without extra screenshots", async () => {
-  const f = fixture();
-  const app = await f.cua.getApp("Example");
-  const options = { clickCount: 2 };
-  assert.equal(await app.click([10, 20], options), 7);
-  assert.equal(f.calls[0][1], options);
-  assert.equal(await app.getState(), "state");
-  assert.equal(app.value, 7);
-  assert.deepEqual(f.events.map((e) => e.kind), ["action", "status"]);
-  assert.equal(f.events[0].x, 10);
-  assert.equal(f.events[0].y, 20);
-  assert.equal(f.events[0].surface, "app:1");
-  assert.equal(f.events[1].status, "ok");
-  assert.equal(typeof f.events[0].t, "number");
-  assert.deepEqual(f.screenshots, []);
-  assert.ok(f.writes.every((value) => value.endsWith("\n")));
-  assert.equal(f.writes.join("").trim().split("\n").length, 2);
-});
-
-test("repeated bootstrap and repeated wrapping do not double capture", async () => {
-  const f = fixture();
-  const app = await f.cua.getApp("Example");
-  const helper = f.context.__showandtell;
-  vm.runInContext(source, f.context);
-  assert.equal(f.context.__showandtell, helper);
-  assert.equal(await f.cua.getApp("Example"), app);
-  assert.equal(helper.wrap(app), app);
-  await app.click(5);
-  assert.equal(f.events.filter((e) => e.kind === "action").length, 1);
-  assert.equal(f.events.find((e) => e.kind === "action").x, null);
-});
-
-test("fresh call scopes reuse one recorder without nested capture", async () => {
-  const f = fixture();
-  f.context.existing = await f.cua.getApp("Example");
-  const helper = f.context.__showandtell;
-  for (let i = 0; i < 3; i++) {
-    const reused = await vm.runInContext(`(async () => {
-      ${source}
-      existing = __showandtell.wrap(existing);
-      await existing.click([1, 2]);
-      return __showandtell;
-    })()`, f.context);
-    assert.equal(reused, helper);
+async function scenario(run, options) {
+  const root = await mkdtemp(join(tmpdir(), "showandtell-recorder-"));
+  let recorder;
+  try {
+    const e = await engine(root, options);
+    recorder = e.recorder;
+    await run(e, root);
+    assert.deepEqual(Reflect.ownKeys(e.proxyTarget), []); // The engine's proxy is never written to.
+    assert.equal(Object.isFrozen(e.nodeRepl), true);
+  } finally {
+    await recorder?.close();
+    delete globalThis.__showandtellCaptureV7;
+    await rm(root, { recursive: true, force: true });
   }
-  assert.equal(f.calls.length, 3);
-  const actions = f.events.filter((e) => e.kind === "action");
-  assert.equal(actions.length, 3);
-  assert.deepEqual(actions.map((e) => e.id.split("-").at(-1)), ["1", "2", "3"]);
-  assert.equal(f.events.filter((e) => e.kind === "image").length, 0);
-});
+}
 
-test("older recorder registry cannot suppress the direct capture API", async () => {
-  const old = { wrap(value) { return value; } };
-  const context = vm.createContext({ __showandtellCaptureV1: old, __showandtellCaptureV2: old,
-    __showandtellCaptureV4: old, __showandtellCaptureV5: old, cua: {}, nodeRepl: { write() {} } });
-  vm.runInContext(source, context);
-  assert.equal(context.__showandtellCaptureV1, old);
-  assert.notEqual(context.__showandtell, old);
-  assert.equal(typeof context.__showandtell.saveTo, "function");
-});
+const kinds = (events) => events.map((e) => e.kind + (e.phase ? ":" + e.phase : ""));
+const stateOf = async (folder, event) => (await readFile(join(folder, event.image)))[2];
+const requests = (e) => e.f.calls.filter(([name]) => name === "get_app_state").map(([, r]) => r);
 
-test("existing const handles can be instrumented in place", async () => {
-  const f = fixture();
-  f.context.existing = f.target;
-  vm.runInContext("const app = existing; __showandtell.instrument(app, 'existing'); __showandtell.instrument(app, 'existing');", f.context);
-  await vm.runInContext("app.click([1, 2])", f.context);
-  assert.equal(f.events.filter((e) => e.kind === "action").length, 1);
-  await f.context.__showandtell.wrap(f.target).click([1, 2]);
-  assert.equal(f.events.filter((e) => e.kind === "action").length, 2);
-});
+test("reuse mode keeps the screenshot behind every Mac observation, with no extra calls", () => scenario(async (e) => {
+  const folder = await e.folder("turn", "call");
+  await e.recorder.saveTo(folder, "reuse");
+  const app = await e.cua.getApp("Example"); // Its own observation precedes the handle, so no frame yet.
+  assert.equal(await app.getAXState(), "no change"); // The engine's own diff, untouched by capture.
+  assert.deepEqual(e.f.writes.at(-1), ["no change", "cua.state"]); // Displayed exactly like the engine does.
+  await app.click([10, 20], { clickCount: 2 });
+  assert.equal(await app.getAXState({ emit: false }), "Display 10");
+  assert.equal((await app.getScreenshot({ emit: false }))[2], 10);
+  const events = await e.events(folder);
+  assert.deepEqual(kinds(events), ["frame:observed", "action", "status", "frame:observed", "frame:observed"]);
+  assert.deepEqual(requests(e), [{ app: "Example", disableDiff: true }, { app: "Example" }, { app: "Example" }, { app: RESOLVED }]);
+  assert.equal(events[1].x, 10);
+  assert.equal(events[1].y, 20);
+  assert.equal(events[1].type, "click");
+  assert.equal(events[2].status, "ok");
+  assert.deepEqual([...new Set(events.map((x) => x.surface))], ["app:1"]);
+  assert.deepEqual(await Promise.all(events.filter((x) => x.image).map((x) => stateOf(folder, x))), [0, 10, 10]);
+  for (const secret of ["Example", "file:", RESOLVED, "Display", "clickCount"]) assert.equal(JSON.stringify(events).includes(secret), false, secret);
+  assert.equal(e.f.writes.filter(([v]) => typeof v === "string" && v.includes("showandtell")).length, 0);
+}));
 
-test("capture/output failures do not prevent actions or replace their errors", async () => {
-  const expected = new Error("private failure message");
-  const f = fixture({ async getScreenshot() { throw new Error("capture failed"); } });
-  const app = await f.cua.getApp("Example");
-  assert.equal(await app.click([1, 2]), 7);
-  f.target.click = async () => { throw expected; };
-  await assert.rejects(app.click([1, 2]), (error) => error === expected);
-  assert.equal(f.events.at(-1).status, "failed");
-  assert.equal(f.events.filter((e) => e.reason === "screenshot-unavailable").length, 0);
-  assert.equal(JSON.stringify(f.events).includes(expected.message), false);
-  f.context.nodeRepl.write = () => { throw new Error("output failed"); };
-  f.target.click = async () => 42;
-  assert.equal(await app.click(3), 42);
-});
+test("a handle from the first call is instrumented by name and gets free AX frames", () => scenario(async (e) => {
+  const folder = await e.folder("turn", "call");
+  const app = e.handle(RESOLVED); // Created before the recorder existed, like the discovery call.
+  const original = app.getAXState;
+  assert.equal(e.recorder.instrument(app, "app", "Example"), app);
+  assert.notEqual(app.getAXState, original);
+  await e.recorder.saveTo(folder, "reuse");
+  assert.equal(await app.getAXState({ emit: false, disableDiffing: true }), "Display 0");
+  assert.deepEqual(requests(e), [{ app: "Example", disableDiff: true }]);
+  assert.deepEqual(kinds(await e.events(folder)), ["frame:observed"]);
+  // Without a known app name the engine's own method runs and only text is observed.
+  const anonymous = e.recorder.instrument(e.handle(RESOLVED), "app");
+  assert.equal(await anonymous.getAXState({ emit: false }), "no change");
+  assert.deepEqual(requests(e).at(-1), { app: RESOLVED, disableDiff: undefined });
+  assert.deepEqual(kinds(await e.events(folder)), ["frame:observed"]);
+}));
 
-test("text and action option values never appear in markers", async () => {
-  const f = fixture();
-  const app = await f.cua.getApp("Example");
-  await app.typeText(12, "secret-password");
-  await app.click(12, { text: "secret-option" });
+test("actions mode records each state and keeps the caller's next AX diff truthful", () => scenario(async (e) => {
+  const folder = await e.folder("turn", "call");
+  await e.recorder.saveTo(folder);
+  const app = await e.cua.getApp("Example");
+  await app.click([1, 2]); // No frame of this app yet, so a baseline comes first.
+  await app.click([2, 2]);
+  assert.equal(await app.getAXState({ emit: false }), "Display 2"); // Not "no change" after our private screenshots.
+  assert.equal(await app.getAXState({ emit: false }), "no change");
+  assert.deepEqual(requests(e), [
+    { app: "Example", disableDiff: true }, { app: RESOLVED }, { app: RESOLVED }, { app: RESOLVED },
+    { app: "Example", disableDiff: true }, { app: "Example" },
+  ]);
+  const events = await e.events(folder);
+  assert.deepEqual(kinds(events), ["frame:before", "action", "frame:after", "status", "action", "frame:after", "status",
+    "frame:observed", "frame:observed"]);
+  assert.deepEqual(await Promise.all(events.filter((x) => x.image).map((x) => stateOf(folder, x))), [0, 1, 2, 2, 2]);
+  assert.ok(events.every((x, i) => i === 0 || x.t > events[i - 1].t));
+  // A handle without any frame this turn gets one baseline before its first action.
+  const other = e.recorder.instrument(e.handle("/Applications/Other.app"), "app", "Other");
+  await other.click([5, 5]);
+  await other.click([6, 6]);
+  const later = (await e.events(folder)).slice(events.length);
+  assert.deepEqual(kinds(later), ["frame:before", "action", "frame:after", "status", "action", "frame:after", "status"]);
+  assert.equal(later[0].surface, "app:2");
+}));
+
+test("the caller's explicit diff request is overridden only after a private screenshot", () => scenario(async (e) => {
+  await e.recorder.saveTo(await e.folder("turn", "call"));
+  const app = await e.cua.getApp("Example");
+  assert.equal(await app.getAXState({ emit: false, disableDiffing: false }), "no change");
+  await app.click([3, 3]);
+  assert.equal(await app.getAXState({ emit: false, disableDiffing: false }), "Display 3");
+  assert.equal(requests(e).at(-1).disableDiff, true);
+  assert.equal((await app.getAXStateAndScreenshot({ emit: false })).state, "no change");
+  await app.getScreenshot({ emit: false }); // A public screenshot advances the diff as well.
+  assert.equal((await app.getAXStateAndScreenshot({ emit: false })).state, "Display 3");
+}));
+
+test("private screenshot and storage failures never change the requested action", () => scenario(async (e) => {
+  const folder = await e.folder("turn", "call");
+  await e.recorder.saveTo(folder);
+  const app = await e.cua.getApp("Example");
+  e.f.failShots = true;
+  await app.click([4, 4]);
+  let events = await e.events(folder);
+  assert.deepEqual(kinds(events.slice(1)), ["action", "warning:after", "status"]);
+  assert.equal(events.at(-2).reason, "screenshot-unavailable");
+  e.f.failShots = false;
+  const expected = new Error("private click failure");
+  e.f.failClick = expected;
+  await assert.rejects(app.click([5, 5]), (error) => error === expected);
+  events = await e.events(folder);
+  assert.equal(events.at(-1).status, "failed");
+  assert.equal(events.at(-2).phase, "after");
+  assert.equal(JSON.stringify(events).includes("private"), false);
+  e.f.failClick = null;
+  await e.recorder.saveTo(join(folder, "missing", "call"));
+  await app.click([6, 6]);
+  await e.recorder.saveTo(join(folder, "missing", "again"));
+  await app.click([7, 7]);
+  assert.equal(e.f.state, 7);
+  const warnings = e.f.writes.filter(([v]) => typeof v === "string" && v.includes("showandtell"));
+  assert.equal(warnings.length, 1);
+  assert.ok(warnings[0][0].includes("capture-storage-unavailable"));
+  assert.equal(await e.events(folder).then((x) => x.length), events.length);
+}));
+
+test("typed text, keys, options, and app names stay out of the recording", () => scenario(async (e) => {
+  const folder = await e.folder("turn", "call");
+  await e.recorder.saveTo(folder, "reuse");
+  const app = await e.cua.getApp("Example");
+  await app.typeText("secret-password");
+  await app.pressKey("secret-key");
   await app.drag([1, 2], [3, 4]);
-  const actions = f.events.filter((e) => e.kind === "action");
-  assert.equal(actions[0].x, null);
-  assert.equal(actions[0].type, "type");
+  await app.click(12, { text: "secret-option" });
+  const actions = (await e.events(folder)).filter((x) => x.kind === "action");
+  assert.deepEqual(actions.map((x) => [x.type, x.x, x.y]), [["type", null, null], ["key", null, null], ["drag", 1, 2], ["click", null, null]]);
   assert.deepEqual(actions[2].to, [3, 4]);
-  assert.equal(JSON.stringify(f.events).includes("secret"), false);
-});
+  for (const secret of ["secret", "Example", RESOLVED]) assert.equal(JSON.stringify(await e.events(folder)).includes(secret), false, secret);
+}));
 
-test("immutable handles still work through facade and warn for in-place instrumentation", async () => {
-  const f = fixture();
-  Object.freeze(f.target);
-  f.context.__showandtell.instrument(f.target, "existing");
-  const app = await f.cua.getApp("Example");
-  assert.equal(await app.click([1, 2]), 7);
-  assert.equal(f.events.filter((e) => e.kind === "warning").length, 1);
-  assert.equal(f.events.filter((e) => e.kind === "action").length, 1);
-});
+test("reinjection reuses one recorder and never stacks wrappers", () => scenario(async (e) => {
+  const folder = await e.folder("turn", "call");
+  await e.recorder.saveTo(folder, "reuse");
+  const getApp = e.cua.getApp;
+  const again = await new AsyncFunction("cua", "nodeRepl", e.source + "\nreturn __showandtell;")(e.cua, e.nodeRepl);
+  assert.equal(again, e.recorder);
+  assert.equal(e.cua.getApp, getApp);
+  const app = await e.cua.getApp("Example");
+  const method = app.click;
+  assert.equal(e.recorder.instrument(app, "app", "Example"), app);
+  assert.equal(app.click, method);
+  await app.click([1, 1]);
+  assert.equal((await e.events(folder)).filter((x) => x.kind === "action").length, 1);
+}));
 
-test("surface identities reveal no creator arguments and action types are normalized", async () => {
-  const f = fixture();
-  f.target.goto = async () => {};
-  f.target.pressKey = async () => {};
-  f.target.selectText = async () => {};
-  f.cua.getTab = async () => f.target;
-  vm.runInContext(source, f.context);
-  const tab = await f.cua.getTab("https://example.test/?token=secret");
-  await tab.goto("https://another.test/?token=secret");
-  await tab.pressKey("secret");
-  await tab.selectText(1, "secret");
-  assert.deepEqual(f.events.filter((e) => e.kind === "action").map((e) => e.type),
-    ["navigate", "key", "select"]);
-  assert.equal(f.events[0].surface, "browser:1");
-  assert.equal(JSON.stringify(f.events).includes("secret"), false);
-  assert.equal(JSON.stringify(f.events).includes("example.test"), false);
-});
-
-test("immutable creator methods emit one generic warning without breaking access", async () => {
-  const f = fixture();
-  f.cua.getTab = async () => f.target;
-  Object.freeze(f.cua);
-  vm.runInContext(source, f.context);
-  vm.runInContext(source, f.context);
-  assert.equal(await f.cua.getTab("secret"), f.target);
-  await f.context.__showandtell.wrap(f.target).click([1, 2]);
-  assert.equal(f.events.filter((e) => e.reason === "immutable-creator").length, 1);
-  assert.equal(JSON.stringify(f.events).includes("secret"), false);
-});
-
-test("existing screenshot is sampled once with unchanged bytes/options and no duplicate image", async () => {
-  const foreign = vm.runInNewContext("new Uint8Array([137, 80, 78, 71])");
-  const options = { emit: true };
-  let shots = 0;
-  const f = fixture({ async getScreenshot(value) {
-    assert.equal(this, f.target);
-    assert.equal(value, options);
-    shots++;
-    f.context.nodeRepl.emitImage(foreign); // Normal CUA emission must remain the only image.
-    return foreign;
-  } });
-  const app = await f.cua.getApp("Example");
-  assert.equal(await app.getScreenshot(options), foreign);
-  assert.equal(shots, 1);
-  assert.equal(f.events.filter((e) => e.kind === "image").length, 1);
-  assert.equal(f.events.filter((e) => e.kind === "frame").length, 1);
-  assert.equal(f.events.find((e) => e.kind === "frame").phase, "observed");
-});
-
-test("state plus screenshot preserves result identity without retaining AX text", async () => {
-  const result = { state: "private AX text", screenshot: new Uint8Array([1, 2, 3]) };
-  const options = { emit: false, disableDiffing: true };
-  const f = fixture({ async getAXStateAndScreenshot(value) {
-    assert.equal(this, f.target);
-    assert.equal(value, options);
-    return result;
-  } });
-  const app = await f.cua.getApp("Example");
-  assert.equal(await app.getAXStateAndScreenshot(options), result);
-  assert.deepEqual(f.events.map((e) => e.kind), ["frame"]);
-  assert.equal(f.writes.join("").includes(result.state), false);
-  assert.deepEqual(f.screenshots, []);
-});
-
-test("text-only observations are not images and observation errors remain unchanged", async () => {
-  const expected = new Error("private screenshot failure");
-  const f = fixture({ async getAXStateAndScreenshot() { return { state: "AX text" }; } });
-  const app = await f.cua.getApp("Example");
-  await app.getAXStateAndScreenshot();
-  f.target.getAXStateAndScreenshot = async () => "AX text";
-  await app.getAXStateAndScreenshot();
-  f.target.getScreenshot = async () => "AX text";
-  await app.getScreenshot();
-  assert.deepEqual(f.events, []);
-  f.target.getScreenshot = async () => { throw expected; };
-  await assert.rejects(app.getScreenshot(), (error) => error === expected);
-});
-
-test("nested public observation wrapping never calls or emits an extra screenshot", async () => {
-  const f = fixture({ async getAXStateAndScreenshot(options) {
-    return { state: "AX text", screenshot: await this.getScreenshot(options) };
-  } });
-  f.context.__showandtell.instrument(f.target);
-  f.context.__showandtell.instrument(f.target);
-  const app = f.context.__showandtell.wrap(f.context.__showandtell.wrap(f.target));
-  await app.getAXStateAndScreenshot({ emit: false });
-  assert.equal(f.screenshots.length, 1);
-  assert.equal(f.events.filter((e) => e.kind === "frame").length, 2);
-  assert.equal(f.events.filter((e) => e.kind === "image").length, 0);
-});
-
-test("concurrent public observations retain both returned images", async () => {
-  const resolve = [];
-  const f = fixture({ getScreenshot() { return new Promise((done) => resolve.push(done)); } });
-  const app = await f.cua.getApp("Example");
-  const first = app.getScreenshot({ emit: false });
-  const second = app.getScreenshot({ emit: false });
-  const a = new Uint8Array([1, 2, 3]);
-  const b = new Uint8Array([4, 5, 6]);
-  resolve[1](b);
-  assert.equal(await second, b);
-  resolve[0](a);
-  assert.equal(await first, a);
-  assert.equal(f.events.filter((e) => e.kind === "frame").length, 2);
-  assert.equal(new Set(f.events.map((e) => e.id)).size, 2);
-  assert.equal(f.events.filter((e) => e.kind === "image").length, 0);
-});
-
-test("observations and actions sharing the clock remain strictly ordered", async () => {
-  const f = fixture();
-  vm.runInContext("Date.now = () => 2000000000000", f.context);
-  const app = await f.cua.getApp("Example");
-  await app.getScreenshot({ emit: false });
-  await app.click([1, 2]);
-  await app.getScreenshot({ emit: false });
-  assert.deepEqual(f.events.map((e) => e.kind), ["frame", "action", "status", "frame"]);
-  assert.ok(f.events.every((e, i) => i === 0 || e.t > f.events[i - 1].t));
-});
-
-test("direct capture saves large bytes privately without tool-result images and switches calls", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "showandtell-capture-"));
-  const bytes = vm.runInNewContext("new Uint8Array(1100000).fill(37)");
-  const writes = [];
-  let clicks = 0;
-  let screenshots = 0;
-  const app = { async getScreenshot() { screenshots++; return bytes; }, async click() { clicks++; return 42; } };
-  const api = { async getApp() { return app; } };
-  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
-  try {
-    // Native CUA supports Node imports; exercise the same import outside vm contexts.
-    const recorder = await new AsyncFunction("cua", "nodeRepl", source + "\nreturn __showandtell;")(
-      api, { write(value) { writes.push(value); }, emitImage() { assert.fail("Images must stay on disk"); } });
-    recorder.instrument(app);
-    recorder.instrument(app);
-    for (const call of ["full", "reuse"]) {
-      const folder = join(directory, call);
-      await mkdir(folder);
-      await recorder.saveTo(folder, call);
-      const handle = await api.getApp();
-      if (call === "reuse") assert.equal(await handle.getScreenshot({ emit: false }), bytes);
-      assert.equal(await handle.click([10, 20]), 42);
-      if (call === "reuse") assert.equal(await handle.getScreenshot({ emit: false }), bytes);
-      const entries = (await readFile(join(folder, "events.jsonl"), "utf8")).trim().split("\n").map(JSON.parse);
-      assert.deepEqual(entries.map((entry) => entry.kind), call === "full"
-        ? ["frame", "action", "frame", "status"] : ["frame", "action", "status", "frame"]);
-      assert.deepEqual(entries.filter((entry) => entry.image).map((entry) => entry.phase),
-        call === "full" ? ["before", "after"] : ["observed", "observed"]);
-      assert.equal(entries[1].x, 10);
-      assert.equal(entries.find((entry) => entry.kind === "status").status, "ok");
-      assert.equal((await readdir(folder)).length, 3);
-      for (const entry of entries.filter((entry) => entry.image)) {
-        assert.deepEqual(new Uint8Array(await readFile(join(folder, entry.image))), new Uint8Array(bytes));
-        assert.equal((await stat(join(folder, entry.image))).mode & 0o777, 0o600);
-      }
-      if (call === "reuse") {
-        // A permission retry can repeat PreToolUse for the same tool call.
-        await recorder.saveTo(folder, "reuse");
-        assert.equal(await handle.click([30, 40]), 42);
-        const appended = (await readFile(join(folder, "events.jsonl"), "utf8")).trim().split("\n").map(JSON.parse);
-        assert.equal(appended.filter((event) => event.kind === "action").length, 2);
-        assert.equal(appended.at(-1).status, "ok");
-      }
-    }
-    assert.equal(clicks, 3);
-    assert.equal(screenshots, 4);
-    assert.deepEqual(writes, []);
-    const failedFolder = join(directory, "failed");
-    await mkdir(failedFolder);
-    await recorder.saveTo(failedFolder, "full");
-    const expected = new Error("private action failure");
-    app.getScreenshot = async () => { throw new Error("private screenshot failure"); };
-    app.click = async () => { throw expected; };
-    await assert.rejects((await api.getApp()).click([1, 2]), (error) => error === expected);
-    const failures = (await readFile(join(failedFolder, "events.jsonl"), "utf8")).trim().split("\n").map(JSON.parse);
-    assert.equal(failures.filter((event) => event.reason === "screenshot-unavailable").length, 2);
-    assert.equal(failures.at(-1).status, "failed");
-    assert.equal(JSON.stringify(failures).includes("private"), false);
-    // Storage failure must preserve the requested computer action, even if output also fails.
-    await recorder.saveTo(join(directory, "missing"));
-    app.click = async () => 42;
-    assert.equal(await (await api.getApp()).click([1, 2]), 42);
-    assert.ok(writes.some((value) => value.includes("capture-storage-unavailable")));
-  } finally {
-    delete globalThis.__showandtellCaptureV6;
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("default actions capture every intermediate state and reuse an observed baseline", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "showandtell-actions-"));
-  const outputs = [];
-  let shots = 0;
-  const app = {
-    state: 9,
-    async getScreenshot(options) {
-      assert.equal(this, app);
-      assert.equal(options.emit, false);
-      shots++;
-      return new Uint8Array([this.state]);
-    },
-    async click(point, options) {
-      assert.equal(this, app);
-      assert.equal(options, privateOptions);
-      this.state = point[0];
-      return this.state;
-    },
+test("browser tabs are instrumented in place with before/after frames", async () => {
+  const bytes = () => new Uint8Array([137, 80, 78, 71, 1]);
+  const tab = {
+    id: "tab-1", calls: [],
+    async getScreenshot(o) { this.calls.push(["screenshot", o]); return bytes(); },
+    async getAXState() { return "AX text"; },
+    async getAXStateAndScreenshot() { return { state: "AX text", screenshot: bytes() }; },
+    async goto(url) { this.calls.push(["goto", url]); },
+    async click(p) { this.calls.push(["click", p]); return 7; },
+    async typeText(index, text) { this.calls.push(["type", index, text]); },
   };
-  const privateOptions = { text: "private option" };
-  const observed = {
-    state: 40,
-    async getScreenshot() { shots++; return new Uint8Array([this.state]); },
-    async click() { this.state++; return this.state; },
-  };
-  const api = { async getApp(name) { return name === "observed" ? observed : app; } };
-  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
-  try {
-    const recorder = await new AsyncFunction("cua", "nodeRepl", source + "\nreturn __showandtell;")(
-      api, { write(value) { outputs.push(value); }, emitImage() { assert.fail("No duplicate tool images"); } });
-    const folder = join(directory, "batch");
-    await mkdir(folder);
-    await recorder.saveTo(folder); // Public default must preserve the AC state inside a batch.
-    const handle = await api.getApp("calculator");
-    for (let state = 0; state < 7; state++) assert.equal(await handle.click([state, 2], privateOptions), state);
-    const entries = (await readFile(join(folder, "events.jsonl"), "utf8")).trim().split("\n").map(JSON.parse);
-    const frames = entries.filter((entry) => entry.kind === "frame");
-    assert.equal(shots, 8);
-    assert.equal(frames.filter((entry) => entry.phase === "before").length, 1);
-    assert.equal(frames.filter((entry) => entry.phase === "after").length, 7);
-    assert.deepEqual(await Promise.all(frames.map(async (entry) => (await readFile(join(folder, entry.image)))[0])),
-      [9, 0, 1, 2, 3, 4, 5, 6]);
-    for (const action of entries.filter((entry) => entry.kind === "action")) {
-      assert.ok(entries.find((entry) => entry.kind === "frame" && entry.phase === "after" && entry.id === action.id));
-      assert.equal(entries.find((entry) => entry.kind === "status" && entry.id === action.id).status, "ok");
-    }
-    assert.equal(JSON.stringify(entries).includes(privateOptions.text), false);
-    const other = await api.getApp("observed");
-    await other.getScreenshot({ emit: false });
-    const before = shots;
-    assert.equal(await other.click([1, 2]), 41);
-    assert.equal(shots - before, 1); // Its ordinary observation replaces the extra baseline.
-    const expected = new Error("private click failure");
-    observed.click = async function () { this.state = 42; throw expected; };
-    await assert.rejects(other.click([1, 2]), (error) => error === expected);
-    const final = (await readFile(join(folder, "events.jsonl"), "utf8")).trim().split("\n").map(JSON.parse);
-    assert.equal(final.at(-1).status, "failed");
-    assert.equal(final.at(-2).phase, "after");
-    assert.equal((await readFile(join(folder, final.at(-2).image)))[0], 42);
-    assert.equal(JSON.stringify(final).includes(expected.message), false);
-    assert.deepEqual(outputs, []);
-    const sameTurn = join(directory, "next-call");
-    await mkdir(sameTurn);
-    await recorder.saveTo(sameTurn);
-    const sameTurnShots = shots;
-    await handle.click([7, 2], privateOptions);
-    assert.equal(shots - sameTurnShots, 1);
-    const nextTurn = join(directory, "next-turn", "call");
-    await mkdir(nextTurn, { recursive: true });
-    await recorder.saveTo(nextTurn);
-    const nextTurnShots = shots;
-    await handle.click([8, 2], privateOptions);
-    assert.equal(shots - nextTurnShots, 2); // Previous turn's images are not in this video.
-  } finally {
-    delete globalThis.__showandtellCaptureV6;
-    await rm(directory, { recursive: true, force: true });
-  }
+  await scenario(async (e) => {
+    const folder = await e.folder("turn", "call");
+    await e.recorder.saveTo(folder);
+    const bound = await e.cua.getTab("https://example.test/?token=secret");
+    assert.equal(bound, tab);
+    await bound.goto("https://another.test/?token=secret");
+    assert.equal(await bound.click([30, 40]), 7);
+    await bound.typeText(3, "secret");
+    assert.equal(await bound.getAXState(), "AX text");
+    assert.deepEqual(await bound.getAXStateAndScreenshot(), { state: "AX text", screenshot: bytes() });
+    const events = await e.events(folder);
+    assert.deepEqual(kinds(events), ["frame:before", "action", "frame:after", "status", "action", "frame:after", "status",
+      "action", "frame:after", "status", "frame:observed"]);
+    assert.deepEqual(events.filter((x) => x.kind === "action").map((x) => [x.type, x.x, x.y]), [["navigate", null, null], ["click", 30, 40], ["type", null, null]]);
+    assert.deepEqual([...new Set(events.map((x) => x.surface))], ["browser:1"]);
+    assert.deepEqual(tab.calls.filter(([k]) => k === "screenshot").map(([, o]) => o.emit), [false, false, false, false]);
+    assert.deepEqual(requests(e), []);
+    for (const secret of ["secret", "example.test", "AX text", "tab-1"]) assert.equal(JSON.stringify(events).includes(secret), false, secret);
+  }, { tab });
 });
 
-test("private Mac screenshots cannot consume the caller's next AX update", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "showandtell-ax-"));
-  const expected = new Error("private AX error");
-  const axCalls = [];
-  const options = { emit: false, disableDiffing: false, detail: "preserved" };
-  const extra = { unchanged: true };
+test("frozen handles warn once and keep working", async () => {
+  const tab = Object.freeze({ async click() { return 1; }, async getScreenshot() { return new Uint8Array([1]); } });
+  await scenario(async (e) => {
+    await e.recorder.saveTo(await e.folder("turn", "call"));
+    assert.equal(await (await e.cua.getTab("x")).click([1, 1]), 1);
+    assert.equal(await (await e.cua.getTab("x")).click([1, 1]), 1);
+    assert.deepEqual(e.f.writes.map(([w]) => JSON.parse(w).reason), ["immutable-target"]);
+  }, { tab });
+});
+
+test("non-Mac app handles get screenshots only through their own methods", () => scenario(async (e) => {
+  const folder = await e.folder("turn", "call");
+  await e.recorder.saveTo(folder);
   let shots = 0;
-  let failScreenshot = false;
-  let failAX = false;
-  const app = {
-    state: 9, previous: null,
-    async getScreenshot(value) {
-      assert.equal(value.emit, false);
-      shots++;
-      this.previous = this.state; // Mac's screenshot RPC advances the AX cache too.
-      if (failScreenshot) throw new Error("private screenshot error");
-      return new Uint8Array([this.state]);
-    },
-    async getAXState(value, other) {
-      axCalls.push({ value, other });
-      if (failAX) { failAX = false; throw expected; }
-      const result = value?.disableDiffing || this.previous !== this.state ? `Display ${this.state}` : "no change";
-      this.previous = this.state;
-      return result;
-    },
-    async getAXStateAndScreenshot(value, other) {
-      return { state: await this.getAXState(value, other), screenshot: await this.getScreenshot(value) };
-    },
-    async click(point) { this.state = point[0]; return this.state; },
-  };
-  const api = { computer: { target: "mac" }, async getApp() { return app; } };
-  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
-  try {
-    const recorder = await new AsyncFunction("cua", "nodeRepl", source + "\nreturn __showandtell;")(
-      api, { write() {}, emitImage() { assert.fail("No duplicate images"); } });
-    await recorder.saveTo(directory);
-    const handle = await api.getApp();
-    assert.equal(await handle.getAXState(options, extra), "Display 9");
-    assert.equal(axCalls.at(-1).value, options); // Clean observations keep their original options object.
-    await handle.click([0, 0]);
-    assert.equal(shots, 2);
-    assert.equal(await handle.getAXState(options, extra), "Display 0");
-    assert.deepEqual(axCalls.at(-1).value, { ...options, disableDiffing: true });
-    assert.equal(axCalls.at(-1).other, extra);
-    assert.equal(options.disableDiffing, false);
-    assert.equal(shots, 2); // AX stays an AX call: no combined RPC or additional screenshot.
-    assert.equal(await handle.getAXState(options, extra), "no change");
-    assert.equal(axCalls.at(-1).value, options);
-    failScreenshot = true;
-    await handle.click([1, 0]);
-    failAX = true;
-    await assert.rejects(handle.getAXState(options, extra), (error) => error === expected);
-    assert.equal(await handle.getAXState(options, extra), "Display 1"); // Failed AX did not clear the flag.
-    assert.equal(axCalls.at(-1).value.disableDiffing, true);
-    failScreenshot = false;
-    await handle.getScreenshot(options);
-    const combined = await handle.getAXStateAndScreenshot(options, extra);
-    assert.equal(combined.state, "Display 1");
-    assert.deepEqual(combined.screenshot, new Uint8Array([1]));
-    assert.equal(axCalls.at(-1).value.emit, false);
-    assert.equal(axCalls.at(-1).value.disableDiffing, true);
-    assert.equal(axCalls.at(-1).other, extra);
-    await handle.getAXState(options, extra);
-    assert.equal(axCalls.at(-1).value, options);
-    const saved = await readFile(join(directory, "events.jsonl"), "utf8");
-    assert.equal(saved.includes("Display"), false);
-    assert.equal(saved.includes(expected.message), false);
-    assert.equal(saved.includes("preserved"), false);
-  } finally {
-    delete globalThis.__showandtellCaptureV6;
-    await rm(directory, { recursive: true, force: true });
-  }
-});
+  const app = { async getScreenshot() { shots++; return new Uint8Array([137, 80, 78, 71]); }, async getAXState() { return "state"; }, async click() { return 3; } };
+  e.cua.getApp = async () => app;
+  e.recorder.install(e.cua);
+  const bound = await e.cua.getApp({ windowId: 1 });
+  assert.equal(await bound.click([2, 2]), 3);
+  assert.equal(await bound.getAXState(), "state");
+  assert.deepEqual(kinds(await e.events(folder)), ["frame:before", "action", "frame:after", "status"]);
+  assert.equal(shots, 2);
+  assert.deepEqual(requests(e), []);
+}, { target: "linux" }));
 
-test("Mac AX refresh override never touches browsers or non-Mac native handles", async () => {
-  const options = { emit: false };
-  const f = fixture({ async getAXState(value) { assert.equal(value, options); return "AX state"; } });
-  f.cua.computer = { target: "mac" };
-  const browser = f.context.__showandtell.wrap(f.target, "browser");
-  await browser.getScreenshot(options);
-  await browser.getAXState(options);
-  for (const target of ["windows", "linux"]) {
-    const native = fixture({ async getAXState(value) { assert.equal(value, options); return "AX state"; } });
-    native.cua.computer = { target };
-    const app = await native.cua.getApp();
-    await app.getScreenshot(options);
-    await app.getAXState(options);
+test("a new turn takes a fresh baseline; a retried call appends to its own recording", () => scenario(async (e) => {
+  const app = e.recorder.instrument(e.handle(RESOLVED), "app", "Example");
+  const first = await e.folder("turn-1", "call-a");
+  await e.recorder.saveTo(first);
+  await app.click([1, 1]);
+  assert.deepEqual(kinds(await e.events(first)), ["frame:before", "action", "frame:after", "status"]);
+  const second = await e.folder("turn-1", "call-b");
+  await e.recorder.saveTo(second);
+  await app.click([2, 2]);
+  assert.deepEqual(kinds(await e.events(second)), ["action", "frame:after", "status"]);
+  await e.recorder.saveTo(second); // A permission retry repeats PreToolUse for the same call.
+  await app.click([3, 3]);
+  assert.equal((await e.events(second)).filter((x) => x.kind === "action").length, 2);
+  const third = await e.folder("turn-2", "call-c");
+  await e.recorder.saveTo(third);
+  await app.click([4, 4]);
+  assert.deepEqual(kinds(await e.events(third)), ["frame:before", "action", "frame:after", "status"]);
+}));
+
+test("timestamps stay strictly ordered within one millisecond", () => scenario(async (e) => {
+  const folder = await e.folder("turn", "call");
+  await e.recorder.saveTo(folder, "reuse");
+  const now = Date.now;
+  Date.now = () => 2000000000000;
+  try {
+    const app = await e.cua.getApp("Example");
+    await app.getAXState({ emit: false });
+    await app.click([1, 2]);
+    await app.getAXState({ emit: false });
+  } finally {
+    Date.now = now;
   }
-});
+  const events = await e.events(folder);
+  assert.equal(events.length, 4);
+  assert.ok(events.every((x, i) => i === 0 || x.t > events[i - 1].t));
+}));

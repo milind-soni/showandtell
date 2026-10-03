@@ -36,24 +36,12 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "^mcp__codex-cu__js(_reset)?$",
+        "matcher": "^mcp__codex-cu__js_reset$",
         "hooks": [
           {
             "type": "command",
             "command": "SHOWANDTELL_CLIENT=claude sh \"$SHOWANDTELL_ROOT/scripts/run.sh\" hook",
-            "timeout": 30
-          }
-        ]
-      }
-    ],
-    "PostToolUseFailure": [
-      {
-        "matcher": "^mcp__codex-cu__js(_reset)?$",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "SHOWANDTELL_CLIENT=claude sh \"$SHOWANDTELL_ROOT/scripts/run.sh\" hook",
-            "timeout": 30
+            "timeout": 10
           }
         ]
       }

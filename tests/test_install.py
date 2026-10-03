@@ -56,11 +56,11 @@ for package in ("python", "ffmpeg"):
     if package in sys.argv:
         (root / ("need-" + package)).unlink(missing_ok=True)
 ''')
-        self.plugin_root = Path(self.env["CODEX_HOME"]) / "plugins/cache/showandtell/showandtell/0.4.0"
+        self.plugin_root = Path(self.env["CODEX_HOME"]) / "plugins/cache/showandtell/showandtell/0.5.0"
         (self.plugin_root / "scripts").mkdir(parents=True)
-        (self.plugin_root / "plugin.json").write_text(json.dumps({"name": "showandtell", "version": "0.4.0"}))
+        (self.plugin_root / "plugin.json").write_text(json.dumps({"name": "showandtell", "version": "0.5.0"}))
         (self.root / "plugins.json").write_text(json.dumps({"installed": [
-            {"pluginId": "showandtell@showandtell", "installed": True, "version": "0.4.0"}
+            {"pluginId": "showandtell@showandtell", "installed": True, "version": "0.5.0"}
         ]}))
         (self.plugin_root / "scripts/run.sh").write_text(
             f'#!/bin/sh\nexec "{sys.executable}" "$INSTALL_TEST_ROOT/runtime-check.py" "$@"\n')
@@ -177,7 +177,7 @@ for package in ("python", "ffmpeg"):
 
     def test_claude_rejects_invalid_cache_metadata(self):
         self.command("claude", "sys.exit(0)")
-        (self.plugin_root / "plugin.json").write_text(json.dumps({"name": "elsewhere", "version": "0.4.0"}))
+        (self.plugin_root / "plugin.json").write_text(json.dumps({"name": "elsewhere", "version": "0.5.0"}))
         result = self.run_installer("--claude")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("runtime is incomplete", result.stderr)

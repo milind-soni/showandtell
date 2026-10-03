@@ -1,42 +1,49 @@
 #!/usr/bin/env python3
 """Collect computer-use hook results locally. Python standard library + FFmpeg only."""
-import argparse
-import base64
+import sys
+
+if sys.version_info < (3, 10):
+    sys.exit('Showandtell needs Python 3.10+. Run its installer or: brew install python ffmpeg')
+
+# Hooks run once per computer-use call, so only cheap modules load here;
+# hashing, subprocess, and the renderer are imported where they are used.
 from contextlib import contextmanager
 import fcntl
-import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import re
-import shutil
 import stat
 import struct
-import subprocess
-import sys
-import tempfile
 import time
-import uuid
 
 HERE = Path(__file__).resolve().parent
 CUA = re.compile(r'^(?:mcp__cua_repl(?:__|\.)|mcp__codex-cu__)js$')
 RESET = re.compile(r'^(?:mcp__cua_repl(?:__|\.)|mcp__codex-cu__)js_reset$')
-BINDING = re.compile(r'\b(var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*await\s+cua\.(getApp|getTab|createBrowserTab)\s*\(')
+BINDING = re.compile(r'\b(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*await\s+cua\.(getApp|getTab|createBrowserTab)\s*\(\s*(?:(["\'])([^"\'\\\n]{1,200})\3)?')
 DISCOVERY = re.compile(r'^\s*(?:(?:var|let|const)\s+[A-Za-z_$][\w$]*\s*=\s*)?await\s+cua\.(?:getState|getApp|getTab|getBrowser|createBrowserTab|rewriteDocumentation)\([^;]*\)\s*;?\s*$', re.S)
+SAFE_NAME = re.compile(r'[\w-]{1,128}', re.ASCII)
 KINDS = {'click', 'drag', 'scroll', 'move', 'type', 'key', 'navigate', 'select', 'setValue', 'secondary'}
+MODES = ('actions', 'reuse', 'full')
 NO_FRAMES = ('Showandtell saved action metadata but no screenshot frames, so no video was rendered. '
-             'Check capture warnings and local storage. Reuse mode needs normal getScreenshot or '
-             'getAXStateAndScreenshot observations; text-only accessibility observations are not video frames.')
+             'Check capture warnings and local storage. Reuse mode needs normal getScreenshot, getAXState, or '
+             'getAXStateAndScreenshot observations of a Mac app, or screenshot observations of a browser tab.')
 
 
 def data_root():
     return Path(os.environ.get('SHOWANDTELL_HOME', str(Path.home() / '.showandtell'))).expanduser()
 
 
+def sha256(data):
+    import hashlib
+    return hashlib.sha256(data).hexdigest()
+
+
 def key(value):
+    """A safe directory name: identifiers pass through, anything else is hashed."""
     value = str(value or 'unknown')
-    return value if re.fullmatch(r'[\w-]{1,128}', value, re.ASCII) else hashlib.sha256(value.encode()).hexdigest()[:24]
+    return value if SAFE_NAME.fullmatch(value) else sha256(value.encode())[:24]
 
 
 def read_json(path, default):
@@ -45,15 +52,16 @@ def read_json(path, default):
 
 def atomic_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    fd, name = tempfile.mkstemp(dir=path.parent, prefix='.writing-')
+    temporary = path.with_name(f'.writing-{os.getpid()}-{time.monotonic_ns()}')
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(fd, 'w') as f:
             json.dump(value, f, indent=2, allow_nan=False)
             f.write('\n')
-        os.replace(name, path)
+        os.replace(temporary, path)
     finally:
-        if os.path.exists(name):
-            os.unlink(name)
+        if temporary.exists():
+            temporary.unlink()
 
 
 @contextmanager
@@ -152,30 +160,24 @@ def capture_file(path, limit):
 
 
 def capture_id(value):
-    return hashlib.sha256(str(value).encode()).hexdigest()[:32]
+    return key(value)
 
 
-def collect_pending(directory, call_id=None):
+def collect_pending(directory, exclude=None):
+    """Move finished per-call recordings into the turn's session manifest."""
     directory = Path(directory)
-    pending = directory / 'captures'
-    if pending.is_dir() and not pending.is_symlink():
-        with locked(directory, '.capture.lock'):
-            return _collect_pending(directory, call_id)
-    return _collect_pending(directory, call_id)
-
-
-def _collect_pending(directory, call_id=None):
-    """Collect direct CUA captures even when its tool result was truncated."""
-    directory = Path(directory)
-    if call_id and 'capture:' + capture_id(call_id) in read_json(directory / 'session.json', {}).get('calls', []):
-        return True
     pending = directory / 'captures'
     if not pending.is_dir() or pending.is_symlink():
         return False
+    with locked(directory, '.capture.lock'):
+        return _collect_pending(directory, exclude)
+
+
+def _collect_pending(directory, exclude=None):
+    pending = directory / 'captures'
     captured = False
-    folders = [pending / capture_id(call_id)] if call_id else sorted(pending.iterdir())
-    for folder in folders:
-        if not re.fullmatch(r'[0-9a-f]{32}', folder.name) or folder.is_symlink() or not folder.is_dir():
+    for folder in sorted(pending.iterdir()):
+        if folder.name == exclude or not SAFE_NAME.fullmatch(folder.name) or folder.is_symlink() or not folder.is_dir():
             continue
         blocks = []
         try:
@@ -202,9 +204,12 @@ def _collect_pending(directory, call_id=None):
                     blocks.append({'type': 'image', '_capture_bytes': raw})
             blocks.append({'type': 'text', 'text': json.dumps(marker)})
         if blocks:
-            collect({'tool_use_id': 'capture:' + folder.name, 'tool_response': {'content': blocks}}, directory)
+            # Recordings are flat and deleted once read, so they need no call-id dedupe.
+            collect({'tool_response': {'content': blocks}}, directory)
             captured = True
-        shutil.rmtree(folder)
+        for item in folder.iterdir():
+            item.unlink()
+        folder.rmdir()
     return captured
 
 
@@ -268,6 +273,7 @@ def collect(event, directory):
                 try:
                     raw = block.get('_capture_bytes')
                     if not isinstance(raw, bytes):
+                        import base64
                         encoded = block.get('data', '')
                         if not isinstance(encoded, str) or len(encoded) > 28_000_000:
                             session['warnings'].append('Skipped an oversized screenshot.')
@@ -279,7 +285,7 @@ def collect(event, directory):
                     pending = None
                     continue
                 got_image = True
-                name = hashlib.sha256(raw).hexdigest()[:24] + '.' + extension
+                name = sha256(raw)[:24] + '.' + extension
                 frames_dir = directory / 'frames'
                 frames_dir.mkdir(exist_ok=True, mode=0o700)
                 path = frames_dir / name
@@ -317,7 +323,7 @@ def export_turn(turn_dir):
         return {}
     with locked(turn_dir, '.export.lock'):
         with locked(turn_dir):
-            digest = hashlib.sha256((turn_dir / 'session.json').read_bytes()).hexdigest()
+            digest = sha256((turn_dir / 'session.json').read_bytes())
             done = read_json(turn_dir / 'export.json', {})
             if done.get('digest') == digest and done.get('status', 'ready') == 'ready' and (turn_dir / 'video.mp4').exists():
                 return {}
@@ -341,12 +347,13 @@ def export_turn(turn_dir):
 
 def queue_export(turn_dir):
     """Collect now, then let a bounded export process outlive Claude/Codex exit."""
+    import subprocess
     turn_dir = Path(turn_dir).absolute()
     collect_pending(turn_dir)
     if not (turn_dir / 'session.json').exists():
         return {}
     with locked(turn_dir):
-        digest = hashlib.sha256((turn_dir / 'session.json').read_bytes()).hexdigest()
+        digest = sha256((turn_dir / 'session.json').read_bytes())
         done = read_json(turn_dir / 'export.json', {})
         if done.get('digest') == digest and done.get('status', 'ready') == 'ready' and (turn_dir / 'video.mp4').exists():
             return {}
@@ -385,7 +392,7 @@ def export_status(directory=None):
     result = {'directory': str(directory.absolute()), 'actions': len(session.get('actions', [])),
               'frames': len(session.get('frames', []))}
     export = read_json(directory / 'export.json', {})
-    current = export.get('digest') == hashlib.sha256(raw).hexdigest()
+    current = export.get('digest') == sha256(raw)
     result['status'] = export.get('status', 'ready') if current else 'not-exported'
     video = directory / 'video.mp4'
     if current and result['status'] == 'ready' and video.is_file() and not video.is_symlink():
@@ -429,7 +436,7 @@ def hook(event):
         with locked(session_dir):
             runtime = read_json(session_dir / 'runtime.json', {'seen': False, 'bindings': {}})
             if kind == 'UserPromptSubmit' or not runtime.get('current_turn'):
-                runtime['current_turn'] = uuid.uuid4().hex
+                runtime['current_turn'] = os.urandom(16).hex()
                 atomic_json(session_dir / 'runtime.json', runtime)
             turn_dir = session_dir / key(runtime['current_turn'])
         if kind == 'UserPromptSubmit':
@@ -452,48 +459,41 @@ def hook(event):
             previous = dict(runtime['bindings'])
             declared = set()
             for match in BINDING.finditer(code):
-                declared.add(match[2])
-                runtime['bindings'][match[2]] = {'kind': 'app' if match[3] == 'getApp' else 'browser', 'mutable': match[1] != 'const'}
+                declared.add(match[1])
+                # The app name lets the recorder keep the screenshot behind a Mac getAXState.
+                binding = {'kind': 'app', 'app': match[4]} if match[2] == 'getApp' else {'kind': 'browser'}
+                runtime['bindings'][match[1]] = binding
             first = not runtime['seen'] or DISCOVERY.fullmatch(code)
             runtime['seen'] = True
             atomic_json(session_dir / 'runtime.json', runtime)
         if first:
             return {}  # Preserve CUA's required first-call bootstrap verbatim.
-        setup = (HERE / 'capture.js').read_text()
-        pending = turn_dir / 'captures'
         call_id = event.get('tool_use_id')
-        capture_dir = pending / (capture_id(call_id) if call_id else uuid.uuid4().hex)
+        capture_name = capture_id(call_id) if call_id else os.urandom(16).hex()
+        # Earlier calls' recordings are final once this call starts; a retried call keeps its own.
+        collect_pending(turn_dir, exclude=capture_name)
+        pending = turn_dir / 'captures'
+        capture_dir = pending / capture_name
         for path in (session_dir, turn_dir, pending, capture_dir):
             if path.is_symlink():
                 raise ValueError('Capture directory must not be a symlink')
             path.mkdir(exist_ok=True, mode=0o700)
-        mode = os.environ.get('SHOWANDTELL_CAPTURE', 'actions')
-        if mode not in ('actions', 'reuse', 'full'):
-            mode = 'actions'
+        mode = os.environ.get('SHOWANDTELL_CAPTURE', MODES[0])
+        if mode not in MODES:
+            mode = MODES[0]
+        setup = (HERE / 'capture.js').read_text()
         setup += '\nawait __showandtell.saveTo(' + json.dumps(str(capture_dir.resolve())) + ', ' + json.dumps(mode) + ');'
         for name, binding in previous.items():
-            if name in declared:
+            if name in declared or not isinstance(binding, dict):
                 continue
-            operation = name + ' = __showandtell.wrap' if binding['mutable'] else '__showandtell.instrument'
-            setup += '\ntry { if (typeof ' + name + ' !== "undefined") ' + operation + '(' + name + ', ' + json.dumps(binding['kind']) + '); } catch (_) {}'
+            arguments = [name, json.dumps(binding.get('kind', 'app'))]
+            if binding.get('app'):
+                arguments.append(json.dumps(binding['app']))
+            setup += '\ntry { if (typeof ' + name + ' !== "undefined") __showandtell.instrument(' + ', '.join(arguments) + '); } catch (_) {}'
         output = {'hookEventName': 'PreToolUse', 'updatedInput': {**args, 'code': setup + '\n' + code}}
         if not claude:
             output['permissionDecision'] = 'allow'
         return {'hookSpecificOutput': output}
-    if kind in ('PostToolUse', 'PostToolUseFailure') and CUA.fullmatch(tool):
-        captured = collect_pending(turn_dir, event.get('tool_use_id'))
-        if kind == 'PostToolUseFailure':
-            return {}  # Failed tools may contain unrelated images or sensitive error text.
-        if captured:
-            warnings = [marker for block in content_blocks(event.get('tool_response', {}))
-                        if isinstance(block, dict) and block.get('type') == 'text'
-                        for marker in markers(str(block.get('text', ''))) if marker.get('kind') == 'warning']
-            if warnings:
-                collect({**event, 'tool_response': {'content': [
-                    {'type': 'text', 'text': json.dumps(marker)} for marker in warnings]}}, turn_dir)
-        else:
-            collect(event, turn_dir)
-        return {}
     if kind == 'Stop':
         return queue_export(turn_dir)
     return {}
@@ -501,6 +501,7 @@ def hook(event):
 
 def import_transcript(source, directory):
     """Import supported saved MCP results without executing recorded code."""
+    from datetime import datetime
     count = 0
     with Path(source).open() as transcript:
         for line in transcript:
@@ -512,34 +513,43 @@ def import_transcript(source, directory):
             item = payload.get('item', {}) if payload.get('type') == 'item_completed' else {}
             if item.get('type') != 'McpToolCall' or not re.search(r'cua|browser|computer', item.get('server', '')):
                 continue
-            from datetime import datetime
             stamp = datetime.fromisoformat(record['timestamp'].replace('Z', '+00:00')).timestamp()
             collect({'tool_response': item.get('result', {}), 'tool_use_id': item.get('id'), 'recorded_at': stamp}, directory)
             count += 1
     return {'importedCalls': count, 'session': str(Path(directory).resolve())}
 
 
-def main():
-    if sys.argv[1:2] == ['claude-setup']:
+USAGE = '''usage: showandtell.py COMMAND [ARGS]
+  hook                         Read one Codex or Claude lifecycle event from stdin
+  doctor                       Check the two runtime requirements
+  status [DIRECTORY]           Read the latest capture and export status without waiting
+  export DIRECTORY             Render a captured turn and persist export status
+  render DIRECTORY [-o FILE]   Re-render a captured session
+  import TRANSCRIPT -o DIR     Recover available images/markers from a local task transcript
+  claude-setup ...             Configure Claude Code for the installed computer-use runtime'''
+
+
+def positional(argv, flags=('-o', '--output')):
+    """Split a tiny command line into positional arguments and one optional output path."""
+    rest, output = [], None
+    i = 0
+    while i < len(argv):
+        if argv[i] in flags and i + 1 < len(argv):
+            output, i = Path(argv[i + 1]), i + 2
+        else:
+            rest.append(argv[i])
+            i += 1
+    return rest, output
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    command = argv[0] if argv else ''
+    if command == 'claude-setup':
         from claude_setup import main as claude_main
-        claude_main(sys.argv[2:])
+        claude_main(argv[1:])
         return
-    parser = argparse.ArgumentParser(description=__doc__)
-    sub = parser.add_subparsers(dest='command', required=True)
-    sub.add_parser('hook', help='Read one Codex or Claude lifecycle event from stdin')
-    sub.add_parser('doctor', help='Check the two runtime requirements')
-    imp = sub.add_parser('import', help='Recover available images/markers from a local task transcript')
-    imp.add_argument('transcript', type=Path)
-    imp.add_argument('-o', '--output', required=True, type=Path)
-    ren = sub.add_parser('render', help='Re-render a captured session')
-    ren.add_argument('session', type=Path)
-    ren.add_argument('-o', '--output', type=Path)
-    exp = sub.add_parser('export', help='Render a captured turn and persist export status')
-    exp.add_argument('session', type=Path)
-    status = sub.add_parser('status', help='Read the latest capture and export status without waiting')
-    status.add_argument('session', nargs='?', type=Path)
-    args = parser.parse_args()
-    if args.command == 'hook':
+    if command == 'hook':
         try:
             event = json.load(sys.stdin)
             if not isinstance(event, dict):
@@ -548,22 +558,30 @@ def main():
         except Exception as error:
             # A video failure must not break the user's computer-use workflow.
             print(json.dumps({'systemMessage': 'Showandtell: ' + str(error)[:250]}))
-    elif args.command == 'doctor':
+        return
+    if command == 'doctor':
+        import shutil
         checks = {x: shutil.which(x) for x in ('python3', 'ffmpeg', 'ffprobe')}
         print(json.dumps(checks, indent=2))
         if not all(checks.values()):
             sys.exit('Install Python 3 and FFmpeg first (macOS: brew install python ffmpeg).')
-    elif args.command == 'status':
-        print(json.dumps(export_status(args.session), indent=2))
-    elif args.command == 'export':
-        print(json.dumps(export_turn(args.session), indent=2))
-        if read_json(args.session / 'export.json', {}).get('status') == 'error':
+        return
+    rest, output = positional(argv[1:])
+    if command == 'status' and len(rest) <= 1:
+        print(json.dumps(export_status(Path(rest[0]) if rest else None), indent=2))
+    elif command == 'export' and len(rest) == 1:
+        session = Path(rest[0])
+        print(json.dumps(export_turn(session), indent=2))
+        if read_json(session / 'export.json', {}).get('status') == 'error':
             sys.exit(1)
-    elif args.command == 'import':
-        print(json.dumps(import_transcript(args.transcript, args.output)))
-    else:
+    elif command == 'import' and len(rest) == 1 and output:
+        print(json.dumps(import_transcript(Path(rest[0]), output)))
+    elif command == 'render' and len(rest) == 1:
         from render import render_session
-        print(json.dumps(render_session(args.session, args.output or args.session / 'video.mp4'), indent=2))
+        session = Path(rest[0])
+        print(json.dumps(render_session(session, output or session / 'video.mp4'), indent=2))
+    else:
+        sys.exit(USAGE)
 
 
 if __name__ == '__main__':

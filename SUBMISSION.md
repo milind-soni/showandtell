@@ -10,7 +10,7 @@ Public distribution: [GitHub installation](README.md#install). OpenAI directory 
 - Publisher: Milind Soni
 - Category: Productivity
 - Short description: Computer use becomes a video.
-- Description: Turn supported Codex computer-use actions into local MP4 walkthroughs with smooth cursor motion. Captures a screenshot after each action, saves normal screenshot observations, and renders with FFmpeg in the background. Capture adds awaited screenshot and file-write costs. Requires local desktop computer use, Python 3.10+, FFmpeg, and enabled hooks. The experimental Claude adapter depends on native app consent; browser operation on the tested external-client backend is unsupported.
+- Description: Turn supported Codex computer-use actions into local MP4 walkthroughs with smooth cursor motion. Keeps the screenshot the engine already takes for every Mac observation, including text-only accessibility state, saves the screen after each action, and renders with FFmpeg in the background. One hook process per call. Requires local desktop computer use, Python 3.10+, FFmpeg, and enabled hooks. The experimental Claude adapter drives the engine but cannot record: that launch runs REPL code read-only.
 - Website: https://github.com/milind-soni/showandtell
 - Support: https://github.com/milind-soni/showandtell/issues
 - Data handling: https://github.com/milind-soni/showandtell/blob/main/PRIVACY.md
@@ -39,11 +39,17 @@ For the browser fixture, clone the repository and run `python3 -m http.server 87
 3. **Unavailable capture storage.** Test with local writes blocked in a disposable runtime. Expect a storage warning while the requested UI action remains usable. Do not weaken permissions, upload data, or claim a complete recording.
 4. **Reuse without images.** Set `SHOWANDTELL_CAPTURE=reuse`, start a new chat, and perform actions followed only by `getAXState`. Expect saved action metadata and an explicit no-frames warning, with no fabricated video or extra screenshot requests. Default `actions` mode instead requests a screenshot after each action.
 
+## Release notes: 0.5.0
+
+Mac text-only observations are now video frames at no extra cost: the engine already takes a screenshot for `getAXState`, and the recorder keeps it by making the same public engine call instead of letting the image be discarded. After a Showandtell screenshot the agent's next `getAXState` on that app returns a full tree so it never wrongly reports "no change".
+
+Per-call overhead dropped from two hook processes (~130–150 ms each) to one (~28 ms): the post hook is gone, the next call's pre hook and Stop collect recordings, and the hook process loads no heavy Python modules. Default `actions` mode still saves the screen after each action. The recorder never modifies the engine's `cua.computer` or `nodeRepl` objects; it instruments only the app and tab handles. The engine runs REPL code read-only when launched without Codex turn metadata, which is why the Claude route cannot record yet; it reports `capture-storage-unavailable` with the error code. Review changed hooks and start a new chat after upgrading.
+
 ## Release notes: 0.4.0
 
-Default capture now saves the resulting screen after every supported action, including actions in the same tool call, with an initial baseline per surface/turn when needed. Normal screenshot observations are still copied. Zero-extra-screenshot reuse and before/after full capture are optional modes. These are awaited snapshots, not live footage or asynchronous capture.
+Default capture saved the resulting screen after every supported action, including actions in the same tool call, with an initial baseline per surface/turn when needed. Normal screenshot observations were copied. Zero-extra-screenshot reuse and before/after full capture were optional modes.
 
-Added optional Claude Code setup and hook adaptation for the installed bundled Mac MCP, with preserved tool permissions, private configuration, stable runtime copies, separate prompt turns, and failed-call/session-end recovery. Native app approval blocked the headless Claude test, and the external browser test required unavailable Codex turn metadata. Export uses a detached one-off process to survive host exit, with per-turn locking and persisted status/errors. Repeated pre-hooks can append safely to an existing call's capture. Portable plugin metadata is included alongside the Codex compatibility manifest. Review changed hooks and start a new chat after upgrading.
+Added optional Claude Code setup and hook adaptation for the installed bundled Mac MCP, with preserved tool permissions, private configuration, stable runtime copies, separate prompt turns, and session-end recovery. Export uses a detached one-off process to survive host exit, with per-turn locking and persisted status/errors. Portable plugin metadata is included alongside the Codex compatibility manifest.
 
 ## Remaining publisher steps
 

@@ -1,8 +1,8 @@
 # showandtell
 
-Turn Codex computer use into a local video, with an experimental Claude hook adapter. Capture each action's resulting screen, add a smooth animated cursor, and render an MP4 automatically in the background. No continuous screen recorder, recording server, account, or editor.
+Turn Codex computer use into a local video. Showandtell keeps the screenshots the computer-use engine already takes, including the ones behind text-only accessibility observations, adds a smooth animated cursor, and renders an MP4 in the background. No screen recorder, recording server, account, or editor.
 
-[Install](#install) · [Claude Code](#claude-code-experimental) · [Performance](#performance) · [Download v0.4.0](https://github.com/milind-soni/showandtell/releases/tag/v0.4.0)
+[Install](#install) · [Claude Code](#claude-code-experimental) · [Performance](#performance) · [Download v0.5.0](https://github.com/milind-soni/showandtell/releases/tag/v0.5.0)
 
 [Watch the browser demo](demo/showandtell.mp4)
 
@@ -32,11 +32,11 @@ Once enabled, supported computer-use calls are recorded automatically in chats w
 
 > Use Showandtell to record a short walkthrough of https://github.com/milind-soni/showandtell. Browse the README, open Releases, and go back. Use coordinate clicks for smooth cursor animation. Verify that screenshots were saved, then give me the MP4.
 
-Let the turn finish to queue automatic export. On your next message, ask **“Show me the latest Showandtell video from this chat.”** Default capture takes a screenshot after each supported action, including actions in a batch, so an intermediate state such as Calculator's cleared display can appear in the video.
+Let the turn finish to queue automatic export. On your next message, ask **“Show me the latest Showandtell video from this chat.”**
 
 ### Claude Code (experimental)
 
-Showandtell includes a Claude hook adapter for the **bundled local Codex computer-use MCP**, registered as `codex-cu`. The launch/configuration path is verified; native operation also depends on the engine accepting app approval. Install Claude Code first, then:
+Showandtell includes a Claude hook adapter for the **bundled local Codex computer-use MCP**, registered as `codex-cu`. The launch, hook dispatch, and recorder injection are verified. Recording is not: when Claude launches the engine, the engine runs REPL code without Codex turn metadata and therefore read-only, so the recorder cannot save frames and reports `capture-storage-unavailable`. Until that changes, treat the Claude route as a way to drive the engine, not to record it.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/milind-soni/showandtell/main/install.sh | sh -s -- --claude
@@ -44,22 +44,7 @@ curl -fsSL https://raw.githubusercontent.com/milind-soni/showandtell/main/instal
 
 This installs the Codex plugin, discovers the newest installed computer-use configuration, registers its command/arguments/environment with Claude, and adds Showandtell's hooks and skill. Existing unrelated settings are preserved, a changed settings file is backed up, and conflicting MCP configurations are refused. Repeating setup updates Showandtell's own installation. Tool permissions are not auto-approved.
 
-Restart Claude Code and try:
-
-> Use codex-cu to calculate 12 × 12 in Calculator in the background. Use normal screenshot observations and coordinate clicks. Showandtell should record it; give me the capture path.
-
-If the native engine accepts the required app approval, a noninteractive run uses:
-
-```sh
-claude -p 'Use codex-cu to calculate 12 × 12 in Calculator in the background. Use screenshots and coordinate clicks so Showandtell records the walkthrough.' --allowedTools 'mcp__codex-cu__js'
-sh ~/.showandtell/runtime/scripts/run.sh status
-```
-
-**Native capture still needs a running, logged-in Mac desktop, the installed app backend, and app consent accepted by that client.** In our headless Calculator test, the engine requested app approval and Claude declined it, so no native capture occurred. Try interactively in Claude and accept its normal app prompt if shown; this release does not auto-approve or guarantee consent persists into headless runs. Browser calls in the external-client test also failed because the engine required Codex `session_id`/`turn_id` metadata. Claude browser operation is therefore not verified or supported on that tested backend; use Codex for browser capture.
-
-This is unofficial reuse of the bundled MCP, not a standalone public computer-use API. App updates can break it. Rerun setup to refresh the server configuration; manually edited or unrelated `codex-cu` registrations are left for you to review.
-
-Claude captures are namespaced under `~/.showandtell/claude-<session>/<turn>/`. Its recorder runtime is copied into `~/.showandtell/runtime`, so pruning a versioned Codex plugin cache does not remove Claude's hook scripts. Claude's input-rewriting hook leaves its normal permission decision in place. See [Claude hooks](https://code.claude.com/docs/en/hooks) and [MCP setup](https://code.claude.com/docs/en/mcp).
+Native apps need a running, logged-in Mac desktop, the installed app backend, and app consent accepted by that client. Browser calls on the tested bundled backend require Codex `session_id`/`turn_id` metadata that a Claude run does not have; use Codex for browser capture. This is unofficial reuse of the bundled MCP, not a standalone public computer-use API, and app updates can break it.
 
 To test without changing Claude user settings, from a clone:
 
@@ -70,7 +55,7 @@ claude -p 'Use codex-cu to calculate 12 × 12 in Calculator with screenshot obse
   --settings /private/path/to/config/settings.json --allowedTools 'mcp__codex-cu__js'
 ```
 
-The generated files contain local runtime configuration and should stay private. This mode uses the clone's script paths, so keep the clone in place for that run.
+The generated files contain local runtime configuration and should stay private. Claude captures are namespaced under `~/.showandtell/claude-<session>/<turn>/`, and the recorder runtime is copied into `~/.showandtell/runtime`. See [Claude hooks](https://code.claude.com/docs/en/hooks) and [MCP setup](https://code.claude.com/docs/en/mcp).
 
 ### Manual installation
 
@@ -107,53 +92,40 @@ Remove the Codex plugin with `codex plugin remove showandtell@showandtell`. For 
 | Missing prerequisites | Install with [Homebrew](https://brew.sh), then rerun the installer. |
 | Codex does not recognize `plugin` | Update Codex CLI; the installer needs plugin commands. |
 | An existing local marketplace is named `showandtell` | Update that local source and reinstall with `codex plugin add showandtell@showandtell`. The public installer does not replace it. |
-| No video | Check hook enablement, start a new chat, and use supported unified computer-use actions with working screenshots. Shell and API calls are outside capture. Optional reuse mode also needs normal screenshot observations. |
+| No video | Check hook enablement, start a new chat, and use unified computer use. Shell, API, and text-only browser actions have no video frames. |
 | Hook points to a missing old version | Start a new chat or restart the agent to load current hooks. |
+| Clicks appear twice in `session.json` | An older recorder from a long-running chat wrapped the new one. Start a new chat after upgrading. |
+| `capture-storage-unavailable` with `code: EPERM` | The engine ran the recorder read-only. This is the normal state outside Codex (see the Claude section); inside Codex, check the thread's sandbox settings. |
 | Claude cannot find the Mac runtime | Open/update Codex desktop with computer use installed, then rerun Claude setup. |
-| Claude says an app was not approved | Try the native task interactively and review its normal app-approval prompt. Setup cannot grant that consent; headless execution is not guaranteed. |
-| Claude browser call reports missing Codex turn metadata | Use Codex for browser capture. The tested bundled browser backend requires host metadata unavailable in that Claude run. |
 | Export is queued or failed | Use `status`; inspect `export.json` and private `export.log`, then retry with `export <capture-directory>`. |
-| Storage is unavailable | The computer-use runtime must permit local file writes. Report the storage failure instead of claiming a complete video. |
 
 ## What happens
 
-1. `PreToolUse` adds the recorder to the supported JavaScript MCP call after its required first discovery call.
-2. Default `actions` mode takes a screenshot after each supported public app/tab action returns. It also captures a baseline before the first action on a surface if no image of that surface has been saved in the current turn. Normal `getScreenshot` and `getAXStateAndScreenshot` observations are saved too. These screenshot calls and local writes are awaited during capture.
-3. Post hooks collect the private sidecar files, including files from failed calls. Stop collects any remainder and starts a detached export job with disconnected input/output.
+1. `PreToolUse` adds the recorder to the supported JavaScript MCP call after its required first discovery call. It also collects the previous call's recording; there is no per-call post hook.
+2. The recorder instruments the app and tab handles the agent uses. For Mac apps, every observation already makes the engine take a screenshot; `getScreenshot` and `getAXStateAndScreenshot` return it, and for `getAXState` the recorder makes the same public engine call itself so that image becomes a frame instead of being discarded. Default `actions` mode also saves the screen after each action, so batched actions keep every state.
+3. Stop collects the remainder and starts a detached export job with disconnected input/output.
 4. FFmpeg renders 1280×800 H.264 at 60 fps with eased cursor travel, click ripples, drag motion, and shortened idle pauses. Per-turn locking and capture digests avoid duplicate rendering; a successful export atomically replaces the previous video.
 
 There is no continuously running Showandtell daemon. The capture and encoder use local CPU and disk. `status` returns without waiting for rendering and reports queued, rendering, ready, error, or no-frames. Saved captures can be exported again if the machine shuts down or an export fails.
 
 **Codex hook permission behavior:** Codex requires `permissionDecision: "allow"` with `updatedInput` to rewrite a tool call. Showandtell uses this only for the exact CUA JavaScript tool name. Review that behavior before trusting the hook; it is not a passive observer. Claude supports input rewriting without this permission decision, so its adapter omits it. Showandtell does not install a PermissionRequest hook or edit approval settings. See [Codex hooks](https://learn.chatgpt.com/docs/hooks).
 
+**AX diff note:** after Showandtell's own screenshot of an app, the agent's next `getAXState` on that app returns a full accessibility tree instead of a diff. The engine's diff baseline moved, so a diff would wrongly say "no change"; the full tree costs more tokens once per action batch but stays correct.
+
 ## Performance
 
-**Default capture adds a screenshot call after every supported action**, plus an initial baseline when needed. This preserves intermediate results when several actions share one tool call. Screenshot calls and local writes are awaited; operating an app in the background does not make capture asynchronous or free. Hook processes and rewritten JavaScript also cost time and may affect context/token usage. Showandtell makes no extra LLM API requests itself. Only MP4 export runs as a separate background job, consuming local CPU and disk.
+**Lightweight does not mean zero overhead.** Per computer-use call there is one hook process before the call (none after), a small JavaScript prelude that is parsed but not re-executed, and small local writes awaited inside the call so frames survive its end. Export starts separately, so the turn does not wait for FFmpeg; rendering still consumes CPU and disk.
 
-The video holds each saved image until the next screenshot. It captures results after an action returns, not continuous animation, a press-down state, or every stage of a later loading transition. An action without a preceding screenshot of its surface has no synthetic cursor. A turn without usable images reports no-frames instead of fabricating a video.
+| Measurement | 0.4.0 | 0.5.0 | Scope |
+| --- | --- | --- | --- |
+| Hook process per call | 2 × ~130–150 ms | 1 × ~28 ms | Pre + Post before; Pre only now. Apple M5, load average 5; Python 3.14 startup is ~10 ms of it. |
+| Frame for a Mac `getAXState` | not captured | 0 extra engine calls | The engine already took it; the recorder keeps the file it returns. |
+| Frame after each action (`actions` mode) | 1 engine observation | 1 engine observation | 100–700 ms each on Calculator, including the engine's UI-settle wait. |
+| Export a saved 13.35-second video | 1.72 s median | unchanged | 1280×800 at 60 fps. |
 
-Set `SHOWANDTELL_CAPTURE` in the environment launching Codex or Claude, then start a fresh chat to change modes:
+These are component measurements, **not an end-to-end benchmark or speed guarantee**. App load, resolution, disk speed, and recording length change the result. Captures consume disk space until removed.
 
-| Mode | Additional screenshots | Coverage |
-| --- | --- | --- |
-| `actions` (default) | One after each supported action, plus a baseline per surface/turn when needed | Captures intermediate action results even within a batch. |
-| `reuse` | None | Copies only normal screenshot observations; states between observations can be missing. |
-| `full` | One before and one after each supported action | Captures both sides of each action at additional capture cost. |
-
-All modes save normal screenshot observations and use the same detached export. Reuse mode may produce no video when the agent only reads accessibility text.
-
-Baseline component measurements from the earlier full-capture implementation, September 27, 2026, on an Apple M5 with 24 GiB RAM and macOS 26.3.1:
-
-| Measurement | Result | Scope |
-| --- | --- | --- |
-| Native Blender screenshot | 416 ms median | Six calls, 379–471 ms; about 0.78 MB each. |
-| Two extra screenshots per action | About 0.83 seconds | Historical full-mode estimate before hook/file costs, not a measurement of the new default. |
-| Pre/post hook processes | About 65 ms each | Nine runs each; empty post collection; excludes host dispatcher. |
-| Export a saved 13.35-second video | 1.72 seconds median | Three exports, 1.56–2.15 seconds; 1280×800 at 60 fps. |
-
-These are component measurements of 0.2.0, **not an end-to-end benchmark or speed guarantee for 0.4.0**. App load, resolution, disk speed, and recording length change the result. Captures consume disk space until removed.
-
-A fresh October 4 check on a heavily loaded Mac measured roughly 1.03 seconds per pre-hook and 1.58 seconds per empty post-hook before the final launcher adjustment; the system load average was about 150. Host scheduling can dominate overhead. The launcher now skips unrelated Python site startup hooks because the recorder needs only stdlib. This change does not establish a speed guarantee.
+`SHOWANDTELL_CAPTURE=reuse` in the environment launching Codex requests nothing extra and still keeps every Mac observation's screenshot; `SHOWANDTELL_CAPTURE=full` adds screenshots before and after every action. Start a fresh chat after changing the mode.
 
 ## Using it with GitHub
 
@@ -166,13 +138,12 @@ Git commands, `gh`, GitHub MCP/API calls, code edits, and GitHub Copilot actions
 
 ## Limits
 
-- **Snapshots, not live footage.** Default capture saves the screen after each supported action returns. Page animation, scroll transitions, per-character typing, and other changes between screenshots are not preserved. Cursor movement is reconstructed, not the original ghost cursor's exact trajectory.
+- **Snapshots, not live footage.** Page animation, scroll transitions, and per-character typing between observations are not preserved. Cursor movement is reconstructed, not the original ghost cursor's exact trajectory.
 - Coordinate clicks/drags can animate when a preceding screenshot exists. Accessibility-index actions supply no public pointer coordinates, so no position is invented.
-- Use public unified `cua` app/tab methods and mutable `let`/`var` handles. First discovery remains unchanged. Immutable handles may miss capture; reacquire a mutable handle if warned. Direct Playwright and older browser-only tools are not instrumented.
+- The screenshot `cua.getApp(...)` itself takes is not captured; the handle does not exist yet. The first frame comes from the first observation or, in `actions` mode, the first action.
+- Use public unified `cua` app/tab methods with named handles. Frozen handles cannot be instrumented and produce an `immutable-target` warning. Direct Playwright and older browser-only tools are not instrumented.
 - Native screenshots may contain the engine's ghost cursor, so native videos can show duplicate cursors. Browser screenshots tested for the original demo were clean.
-- Optional reuse mode can miss intermediate results within a batch. It cannot recover arbitrary internal screenshots, turn accessibility text into images, or recover truncated legacy image data.
-- Local storage permissions are required. Storage failure produces a warning while the UI action remains usable; it does not weaken permissions.
-- The optional Claude route depends on an unofficial bundled Mac MCP, app approval, and the app backend. Our headless native test stopped at app consent; the browser test stopped at missing Codex turn metadata. It is not a general remote/headless desktop service.
+- Capture needs an engine that lets REPL code write local files. Codex desktop does; a bare launch of the engine (for example by Claude) does not, and the recorder then reports a storage warning while the UI action remains usable.
 
 ## Local tools
 
@@ -191,7 +162,7 @@ sh plugins/showandtell/scripts/run.sh import /path/to/rollout.jsonl -o /path/to/
 
 The legacy importer reads saved Codex CUA/browser MCP results without executing their code. It cannot recover missing frames or exact pointer paths.
 
-Marker logs omit typed text, key values, URLs, and raw tool code. **Screenshots contain whatever is visible.** Review videos before sharing. [Data handling](PRIVACY.md) · [Support](https://github.com/milind-soni/showandtell/issues)
+Marker logs omit typed text, key values, URLs, app names, and raw tool code. **Screenshots contain whatever is visible.** Review videos before sharing. [Data handling](PRIVACY.md) · [Support](https://github.com/milind-soni/showandtell/issues)
 
 ## Packaging and development
 
@@ -201,7 +172,7 @@ The plugin has a portable `plugin.json` plus the Codex compatibility manifest. O
 python3 scripts/package.py
 ```
 
-This creates `dist/showandtell-0.4.0.zip` and its SHA-256 checksum. The archive includes only plugin files, excluding captures and development material. Claude setup discovers the runtime already installed on your Mac; that runtime is not redistributed.
+This creates `dist/showandtell-0.5.0.zip` and its SHA-256 checksum. The archive includes only plugin files, excluding captures and development material. Claude setup discovers the runtime already installed on your Mac; that runtime is not redistributed.
 
 No Python or Node packages are required. Node is needed only for recorder checks:
 
@@ -211,8 +182,6 @@ python3 tests/test_render.py
 node --test tests/test_capture.mjs
 ```
 
-For the disposable browser fixture, run `python3 -m http.server 8768 --bind 127.0.0.1 --directory demo`, then drive `http://127.0.0.1:8768` through computer use. Renderer checks produce a real MP4, verify it with FFprobe, and cover frame chronology, cursor endpoints, bounds, and atomic failure recovery. Hook checks cover Claude prompt/session boundaries, failed calls, preserved permissions, detached export, and concurrent status reads. Setup/installer checks use isolated command stubs and temporary homes.
-
-Validation of the updated default action capture is in progress. The earlier Calculator smoke test verified 144 and detached MP4 export, but reuse mode missed an intermediate cleared display; the new default addresses that gap with a screenshot after each action. A fresh action-mode Calculator demo is pending. Real Claude headless runs reached the MCP and hook dispatcher, but native capture stopped at app approval and browser capture stopped at missing Codex host metadata. These limits are reported above.
+The recorder tests model the engine as REPL code sees it: a read-only `cua.computer` proxy, a frozen `nodeRepl`, observations that return a short-lived screenshot file, and AX text that diffs against the previous observation. They assert that the recorder never writes to those engine objects. Hook checks cover first-call preservation, pre-hook collection, retried calls, Claude prompt/session boundaries, detached export, concurrent status reads, and that the hook process loads no heavy modules. Renderer checks produce a real MP4 and verify it with FFprobe.
 
 For a local Codex installation: `codex plugin marketplace add /absolute/path/to/showandtell`, then `codex plugin add showandtell@showandtell`.

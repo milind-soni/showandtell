@@ -1,6 +1,6 @@
 {
   "name": "showandtell",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Capture supported computer-use action results as local MP4 walkthroughs.",
   "author": {
     "name": "Milind Soni"
@@ -9,7 +9,7 @@
   "interface": {
     "displayName": "Showandtell",
     "shortDescription": "Computer use becomes a video.",
-    "longDescription": "Record supported Codex computer-use actions as local MP4 walkthroughs with smooth cursor motion. Captures a screenshot after each action, saves normal observations, and exports in the background. Capture awaits screenshot calls and local writes. Requires Python, FFmpeg, trusted hooks, and local desktop access. The experimental Claude adapter depends on native app consent; its tested external browser backend is unsupported.",
+    "longDescription": "Record supported Codex computer-use actions as local MP4 walkthroughs with smooth cursor motion. Keeps the screenshot behind every Mac observation, including text-only accessibility state, saves the screen after each action, and exports in the background. One hook process per call; capture awaits small local writes. Requires Python, FFmpeg, trusted hooks, and local desktop access. The experimental Claude adapter can drive the engine but cannot record yet: that launch runs read-only.",
     "developerName": "Milind Soni",
     "category": "Productivity",
     "capabilities": [],

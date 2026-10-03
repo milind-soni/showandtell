@@ -1,214 +1,183 @@
-// Inject only after CUA's first discovery call. This uses public CUA methods only.
-// CUA evaluates calls in fresh scopes, so a local var cannot guard reinjection.
-var __showandtell = globalThis.__showandtellCaptureV6 ||= (() => {
-    const actions = new Set([
-      "click", "drag", "scroll", "typeText", "paste", "pressKey", "setValue",
-      "selectText", "performSecondaryAction", "goto", "back", "forward", "reload",
-    ]);
-    const types = {
-      typeText: "type", paste: "type", pressKey: "key", selectText: "select",
-      performSecondaryAction: "secondary", goto: "navigate", back: "navigate",
-      forward: "navigate", reload: "navigate",
+// Showandtell recorder. Injected after CUA's required first discovery call; the
+// REPL keeps state across calls, so one registry guards against reinjection.
+// Only app/tab handles are instrumented. cua.computer and nodeRepl are the
+// engine's read-only objects and are only ever called, never modified.
+var __showandtell = globalThis.__showandtellCaptureV7 ||= (() => {
+    const actions = {
+      click: "click", drag: "drag", scroll: "scroll", typeText: "type", paste: "type",
+      pressKey: "key", setValue: "setValue", selectText: "select", performSecondaryAction: "secondary",
+      goto: "navigate", back: "navigate", forward: "navigate", reload: "navigate",
     };
-    const observations = new Set(["getScreenshot", "getAXState", "getAXStateAndScreenshot"]);
-    const proxies = new WeakMap();
-    const surfaces = new WeakMap();
-    const wrappedMethods = new WeakSet();
-    const wrappedCreators = new WeakSet();
-    const creatorWarnings = new Set();
-    const warned = new WeakSet();
-    const originals = new WeakMap();
+    const observations = ["getScreenshot", "getAXState", "getAXStateAndScreenshot"];
+    const wrappers = new WeakSet();
+    const handles = new WeakMap();
     const photographed = new Set();
     const needsFullAX = new Set();
+    const warnedOnce = new Set();
+    let surfaceCount = 0;
     let sequence = 0;
-    let surfaceSequence = 0;
+    let lastTime = 0;
     let output = Promise.resolve();
     let destination = null;
-    let captureFolder = null;
-    let mode = "reuse";
-    let lastTime = 0;
+    let turnFolder = null;
+    let mode = "actions";
     const timestamp = () => (lastTime = Math.max(Date.now() / 1000, lastTime + 0.000001));
-    const saveTo = async (directory, captureMode = "actions") => {
+    const nextId = () => `std-${Date.now()}-${++sequence}`;
+    const finite = (n) => typeof n === "number" && Number.isFinite(n);
+    const point = (value) => Array.isArray(value) && value.length === 2 && value.every(finite) ? value : null;
+    const isMac = () => { try { return cua?.computer?.target === "mac"; } catch (_) { return false; } };
+    const warn = async (reason, error) => {
+      if (warnedOnce.has(reason)) return;
+      warnedOnce.add(reason);
+      const code = typeof error?.code === "string" ? { code: error.code } : {};
+      try { await nodeRepl.write(JSON.stringify({ showandtell: 1, kind: "warning", reason, ...code }) + "\n"); } catch (_) {}
+    };
+    const close = async () => {
       await output;
-      try { await destination?.file?.close(); } catch (_) {}
+      const open = destination;
+      destination = null;
+      try { await open?.file?.close(); } catch (_) {}
+    };
+    const saveTo = async (directory, captureMode = "actions") => {
+      await close();
       const folder = directory.slice(0, directory.lastIndexOf("/"));
-      if (captureFolder !== folder) photographed.clear();
-      captureFolder = folder;
+      if (turnFolder !== folder) photographed.clear();
+      turnFolder = folder;
       mode = ["reuse", "actions", "full"].includes(captureMode) ? captureMode : "actions";
-      destination = { directory };
       try {
         const fs = await import("node:fs/promises");
-        destination = { directory, fs, file: await fs.open(directory + "/events.jsonl",
-          fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | fs.constants.O_NOFOLLOW, 0o600) };
-      } catch (_) {
-        try { await nodeRepl.write(JSON.stringify({ showandtell: 1, kind: "warning",
-          reason: "capture-storage-unavailable" }) + "\n"); } catch (_) {}
+        const { fileURLToPath } = await import("node:url");
+        const file = await fs.open(directory + "/events.jsonl",
+          fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | fs.constants.O_NOFOLLOW, 0o600);
+        destination = { directory, fs, fileURLToPath, file };
+      } catch (error) {
+        await warn("capture-storage-unavailable", error);
       }
     };
-    const surfaceFor = (target, kind) => {
-      if (!surfaces.has(target)) {
-        surfaces.set(target, `${kind === "browser" ? "browser" : "app"}:${++surfaceSequence}`);
-      }
-      return surfaces.get(target);
-    };
-    const point = (value) => Array.isArray(value) && value.length === 2 &&
-      value.every((n) => typeof n === "number" && Number.isFinite(n)) ? value : null;
-    const imageBytes = (value) => ArrayBuffer.isView(value) && value.BYTES_PER_ELEMENT === 1 && value.byteLength
-      ? new Uint8Array(new Uint8Array(value.buffer, value.byteOffset, value.byteLength)) : null;
-    const emit = (event, image, emitImage = true) => {
+    const emit = (event, image) => {
       const sink = destination;
-      event = { ...event, t: timestamp() };
+      const entry = { showandtell: 1, ...event, t: timestamp() };
+      if (!sink) return output;
       output = output.then(async () => {
-        if (sink) {
-          try {
-            if (!sink.file) return;
-            const entry = { showandtell: 1, ...event };
-            if (image !== undefined) {
-              entry.image = event.id + "-" + event.phase + ".img";
-              await sink.fs.writeFile(sink.directory + "/" + entry.image, image,
-                { flag: "wx", mode: 0o600 });
-            }
-            await sink.file.write(JSON.stringify(entry) + "\n");
-          } catch (_) {
-            await nodeRepl.write(JSON.stringify({ showandtell: 1, kind: "warning",
-              reason: "capture-storage-write-failed" }) + "\n");
+        try {
+          if (image) {
+            entry.image = entry.id + "-" + entry.phase + ".img";
+            await sink.fs.writeFile(sink.directory + "/" + entry.image, image, { flag: "wx", mode: 0o600 });
           }
-          return;
-        }
-        await nodeRepl.write(JSON.stringify({ showandtell: 1, ...event }) + "\n");
-        if (image !== undefined && emitImage) {
-          try { await nodeRepl.emitImage(image); }
-          catch (_) {
-            await nodeRepl.write(JSON.stringify({ showandtell: 1, kind: "warning",
-              id: event.id, surface: event.surface, phase: event.phase,
-              t: timestamp(), reason: "image-emission-failed" }) + "\n");
-          }
+          await sink.file.write(JSON.stringify(entry) + "\n");
+        } catch (error) {
+          await warn("capture-storage-write-failed", error);
         }
       }).catch(() => {});
       return output;
     };
-    const frame = async (target, event, phase) => {
-      if (event.surface.startsWith("app:") && cua.computer?.target === "mac") needsFullAX.add(event.surface);
+    const bytesOf = (value) => ArrayBuffer.isView(value) && value.BYTES_PER_ELEMENT === 1 && value.byteLength
+      ? new Uint8Array(new Uint8Array(value.buffer, value.byteOffset, value.byteLength)) : null;
+    // The Mac engine returns each screenshot as a short-lived file URL.
+    const readShot = async (url) => {
+      const sink = destination;
+      if (!sink || typeof url !== "string" || !url.startsWith("file:")) return null;
+      try { return bytesOf(await sink.fs.readFile(sink.fileURLToPath(url))); } catch (_) { return null; }
+    };
+    const saveFrame = async (event, phase, image) => {
+      if (!image?.length) return false;
+      await emit({ ...event, kind: "frame", phase }, image);
+      photographed.add(event.surface);
+      return true;
+    };
+    const frame = async (target, info, event, phase) => {
       try {
         const method = target.getScreenshot;
-        const screenshot = await Reflect.apply(originals.get(method) ?? method, target, [{ emit: false }]);
-        const image = imageBytes(screenshot);
-        if (image?.length) {
-          await emit({ ...event, kind: "frame", phase }, image);
-          photographed.add(event.surface);
-          return;
-        }
+        const original = wrappers.has(method) ? method.original : method;
+        if (info.mac) needsFullAX.add(info.surface); // Its screenshot advances the engine's AX diff.
+        if (await saveFrame(event, phase, bytesOf(await Reflect.apply(original, target, [{ emit: false }])))) return;
       } catch (_) { /* Capture must never prevent the requested action. */ }
-      await emit({ ...event, kind: "warning", phase,
-        reason: "screenshot-unavailable" });
+      await emit({ ...event, kind: "warning", phase, reason: "screenshot-unavailable" });
     };
-    const observe = async (target, method, type, args, surface) => {
-      const native = surface.startsWith("app:") && cua.computer?.target === "mac";
-      const ax = type === "getAXState" || type === "getAXStateAndScreenshot";
-      // Native Mac screenshots advance the AX diff even when their image is private.
-      if (native && type === "getScreenshot") needsFullAX.add(surface);
-      if (native && ax && needsFullAX.has(surface)) {
-        args = [{ ...args[0], disableDiffing: true }, ...args.slice(1)];
+    // A Mac getAXState already makes the engine take a screenshot and discard
+    // it. Making the same public call ourselves keeps that image as a frame.
+    const observeAX = async (info, options) => {
+      const request = options?.disableDiffing === undefined ? { app: info.app } : { app: info.app, disableDiff: options.disableDiffing };
+      const state = await cua.computer.get_app_state(request);
+      if (typeof state?.text !== "string") return null;
+      if (options?.emit !== false) await nodeRepl.write(state.text, "cua.state");
+      return { text: state.text, image: await readShot(state.screenshot?.url) };
+    };
+    const observe = async (target, info, name, original, args) => {
+      let options = args[0];
+      if (info.mac && name === "getScreenshot") needsFullAX.add(info.surface);
+      if (info.mac && name !== "getScreenshot" && needsFullAX.has(info.surface)) {
+        // A private screenshot advanced the diff; a diff now would claim "no change".
+        options = { ...options, disableDiffing: true };
+        args = [options, ...args.slice(1)];
       }
-      const result = await Reflect.apply(method, target, args);
-      if (native && ax) needsFullAX.delete(surface);
-      const image = imageBytes(type === "getScreenshot" ? result : result?.screenshot);
-      // Nested public observations may repeat a frame; the collector deduplicates its bytes.
-      if (image) {
-        await emit({ id: `std-${Date.now()}-${++sequence}`, surface,
-          kind: "frame", phase: "observed" }, image, false);
-        photographed.add(surface);
+      let result, image = null;
+      const free = info.mac && name === "getAXState" && info.app && destination ? await observeAX(info, options) : null;
+      if (free) {
+        result = free.text;
+        image = free.image;
+      } else {
+        result = await Reflect.apply(original, target, args);
+        image = bytesOf(name === "getScreenshot" ? result : result?.screenshot);
       }
+      if (info.mac && name !== "getScreenshot" && options?.disableDiffing) needsFullAX.delete(info.surface);
+      if (destination) await saveFrame({ id: nextId(), surface: info.surface }, "observed", image);
       return result;
     };
-    const run = async (target, method, type, args, surface) => {
-      const event = { id: `std-${Date.now()}-${++sequence}`, surface };
-      const full = mode === "full";
-      const after = mode !== "reuse";
-      if (full || (after && !photographed.has(surface))) await frame(target, event, "before");
+    const run = async (target, info, type, original, args) => {
+      if (!destination) return Reflect.apply(original, target, args);
+      const event = { id: nextId(), surface: info.surface };
+      if (mode === "full" || (mode === "actions" && !photographed.has(info.surface))) await frame(target, info, event, "before");
       const from = point(args[0]);
       const details = { x: from?.[0] ?? null, y: from?.[1] ?? null };
       if (type === "drag") details.to = point(args[1]);
-      await emit({ ...event, kind: "action",
-        type: types[type] ?? type, ...details });
+      await emit({ ...event, kind: "action", type, ...details });
       let status = "failed";
       try {
-        const result = await Reflect.apply(method, target, args);
+        const result = await Reflect.apply(original, target, args);
         status = "ok";
         return result;
       } finally {
-        if (after) await frame(target, event, "after");
+        if (mode !== "reuse") await frame(target, info, event, "after");
         await emit({ ...event, kind: "status", status });
       }
     };
-    const makeMethod = (target, method, type, surface) => {
-      const wrapped = (...args) => (observations.has(type) ? observe : run)(target, method, type, args, surface);
-      wrappedMethods.add(wrapped);
-      originals.set(wrapped, method);
-      return wrapped;
+    const replace = (target, name, make) => {
+      const original = target[name];
+      if (typeof original !== "function" || wrappers.has(original)) return true;
+      const wrapper = make(original);
+      wrapper.original = original;
+      wrappers.add(wrapper);
+      try { return Reflect.set(target, name, wrapper) && target[name] === wrapper; } catch (_) { return false; }
     };
-    const instrument = (target, kind = "app") => {
+    const instrument = (target, kind = "app", app) => {
       if (!target || typeof target !== "object") return target;
-      const surface = surfaceFor(target, kind);
-      let failed = false;
-      for (const type of [...actions, ...observations]) {
-        try {
-          const method = target[type];
-          if (typeof method !== "function" || wrappedMethods.has(method)) continue;
-          const wrapped = makeMethod(target, method, type, surface);
-          if (!Reflect.set(target, type, wrapped) || target[type] !== wrapped) failed = true;
-        } catch (_) { failed = true; }
+      if (handles.has(target)) {
+        if (typeof app === "string" && app) handles.get(target).app = app;
+        return target;
       }
-      if (failed && !warned.has(target)) {
-        warned.add(target);
-        void emit({ kind: "warning", surface, reason: "immutable-target" });
+      const info = { kind, surface: `${kind === "browser" ? "browser" : "app"}:${++surfaceCount}`,
+        mac: kind !== "browser" && isMac(), app: typeof app === "string" && app ? app : undefined };
+      handles.set(target, info);
+      let ok = true;
+      for (const [name, type] of Object.entries(actions)) {
+        ok = replace(target, name, (original) => (...args) => run(target, info, type, original, args)) && ok;
       }
+      for (const name of observations) {
+        ok = replace(target, name, (original) => (...args) => observe(target, info, name, original, args)) && ok;
+      }
+      if (!ok) void warn("immutable-target");
       return target;
     };
-    const wrap = (target, kind = "app") => {
-      if (!target || typeof target !== "object") return target;
-      if (proxies.has(target)) return proxies.get(target);
-      const surface = surfaceFor(target, kind);
-      const methods = new Map();
-      // A separate facade permits wrapping immutable handles without Proxy invariants.
-      const proxy = new Proxy({}, {
-        get(_, property) {
-          const value = Reflect.get(target, property, target);
-          if (typeof value !== "function") return value;
-          const cached = methods.get(property);
-          if (cached?.original === value) return cached.wrapped;
-          const wrapped = (actions.has(property) || observations.has(property)) && !wrappedMethods.has(value)
-            ? makeMethod(target, value, property, surface) : value.bind(target);
-          methods.set(property, { original: value, wrapped });
-          return wrapped;
-        },
-        set(_, property, value) { return Reflect.set(target, property, value, target); },
-        has(_, property) { return property in target; },
-      });
-      proxies.set(target, proxy);
-      proxies.set(proxy, proxy);
-      surfaces.set(proxy, surface);
-      return proxy;
-    };
     const install = (api) => {
-      const warn = (method) => {
-        if (creatorWarnings.has(method)) return;
-        creatorWarnings.add(method);
-        void emit({ kind: "warning", reason: "immutable-creator", method });
-      };
+      if (!api || typeof api !== "object") return;
       for (const name of ["getApp", "getTab", "createBrowserTab"]) {
-        try {
-          const original = api[name];
-          if (typeof original !== "function" || wrappedCreators.has(original)) continue;
-          const creator = async function (...args) {
-            const target = await Reflect.apply(original, this, args);
-            return wrap(target, name === "getApp" ? "app" : "browser");
-          };
-          wrappedCreators.add(creator);
-          if (!Reflect.set(api, name, creator) || api[name] !== creator) warn(name);
-        } catch (_) { warn(name); }
+        const kind = name === "getApp" ? "app" : "browser";
+        if (!replace(api, name, (original) => async function (...args) {
+          return instrument(await Reflect.apply(original, this, args), kind, kind === "app" ? args[0] : undefined);
+        })) void warn("immutable-creator");
       }
     };
-    return { instrument, wrap, install, saveTo };
+    return { install, instrument, saveTo, close };
   })();
 try { __showandtell.install(cua); } catch (_) {}

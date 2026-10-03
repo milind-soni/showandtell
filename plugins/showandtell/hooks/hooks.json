@@ -5,8 +5,8 @@
       "hooks": [{"type": "command", "command": "sh \"${PLUGIN_ROOT}/scripts/run.sh\" hook", "timeout": 10}]
     }],
     "PostToolUse": [{
-      "matcher": "^mcp__cua_repl(__|\\.)js(_reset)?$",
-      "hooks": [{"type": "command", "command": "sh \"${PLUGIN_ROOT}/scripts/run.sh\" hook", "timeout": 30}]
+      "matcher": "^mcp__cua_repl(__|\\.)js_reset$",
+      "hooks": [{"type": "command", "command": "sh \"${PLUGIN_ROOT}/scripts/run.sh\" hook", "timeout": 10}]
     }],
     "SessionStart": [{
       "hooks": [{"type": "command", "command": "sh \"${PLUGIN_ROOT}/scripts/run.sh\" hook", "timeout": 10}]

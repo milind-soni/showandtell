@@ -53,7 +53,7 @@ class HookTests(unittest.TestCase):
         })
         self.environment.start()
         self.addCleanup(self.environment.stop)
-        self.spawn_patch = patch.object(hooks.subprocess, 'Popen')
+        self.spawn_patch = patch('subprocess.Popen')  # queue_export imports subprocess lazily
         self.spawn = self.spawn_patch.start()
         self.addCleanup(self.spawn_patch.stop)
         self.turn = self.home / "session-1" / "turn-1"
@@ -81,7 +81,7 @@ class HookTests(unittest.TestCase):
         injected = output["updatedInput"]["code"]
         self.assertTrue(injected.endswith("\n" + code))
         self.assertIn("__showandtell", injected)
-        self.assertIn('app = __showandtell.wrap(app, "app")', injected)
+        self.assertIn('__showandtell.instrument(app, "app", "Example")', injected)
 
     def test_const_binding_is_instrumented_without_reassignment(self):
         self.pre('const tab = await cua.getTab("123", {browser: "chrome"});')
@@ -238,7 +238,8 @@ class HookTests(unittest.TestCase):
             marker("frame", id="a", surface="app:1", phase="after", t=12, image="after.img"),
             marker("status", id="a", status="ok", t=13),
         ]) + '\n{"interrupted":')
-        hooks.hook(self.event("PostToolUse", tool_use_id="live", tool_response="truncated"))
+        # The next call's PreToolUse collects it; the tool result itself is never needed.
+        hooks.hook(self.event("PreToolUse", tool_use_id="next", tool_input={"code": "await app.getAXState();"}))
         saved = json.loads((self.turn / "session.json").read_text())
         self.assertEqual([(f["phase"], f["t"]) for f in saved["frames"]], [("before", 10), ("after", 12)])
         self.assertEqual((self.turn / saved["frames"][0]["file"]).read_bytes(), screenshot)
@@ -246,11 +247,13 @@ class HookTests(unittest.TestCase):
         self.assertEqual(saved["warnings"], [])
         self.assertFalse(folder.exists())
         self.assertFalse(hooks.collect_pending(self.turn))
-        hooks.hook(self.event("PostToolUse", tool_use_id="live", tool_response={"content": [image()]}))
+        # A retried PreToolUse for the collected call starts a fresh recording folder.
+        hooks.hook(self.event("PreToolUse", tool_use_id="live", tool_input={"code": "await app.click([1, 2]);"}))
         self.assertEqual(json.loads((self.turn / "session.json").read_text()), saved)
-        # If PostToolUse never arrived, Stop still recovers the on-disk recording.
-        self.pre("await app.click([3, 4]);")
-        folder = next((self.turn / "captures").iterdir())
+        self.assertEqual(hooks.hook(self.event("PostToolUse", tool_use_id="live", tool_response={"content": [image()]})), {})
+        # Without another call, Stop still recovers the on-disk recording.
+        hooks.hook(self.event("PreToolUse", tool_use_id="last", tool_input={"code": "await app.click([3, 4]);"}))
+        folder = self.turn / "captures" / hooks.capture_id("last")
         (folder / "events.jsonl").write_text(marker("action", id="b", surface="app:1", type="click", t=14, x=3, y=4))
         renderer = types.ModuleType("render")
         renderer.render_session = Mock(return_value={"duration": 1})
@@ -278,22 +281,33 @@ class HookTests(unittest.TestCase):
         self.assertTrue(outside.exists())
         self.assertTrue(linked_folder.is_symlink())
 
-    def test_post_tool_collects_only_its_call_and_preserves_inflight_captures(self):
+    def test_pre_hook_collects_earlier_calls_but_not_the_call_about_to_run(self):
+        self.pre('let app = await cua.getApp("Example");')
         pending = self.turn / "captures"
         for call in ("one", "two"):
             folder = pending / hooks.capture_id(call)
             folder.mkdir(parents=True)
             (folder / "events.jsonl").write_text(marker("action", id=call, type="click", t=10))
-        hooks.hook(self.event("PostToolUse", tool_use_id="one", tool_response={}))
+        hooks.hook(self.event("PreToolUse", tool_use_id="two", tool_input={"code": "await app.click([1, 2]);"}))
         saved = json.loads((self.turn / "session.json").read_text())
         self.assertEqual([a["id"] for a in saved["actions"]], ["one"])
-        self.assertTrue((pending / hooks.capture_id("two")).exists())
+        self.assertTrue((pending / hooks.capture_id("two") / "events.jsonl").exists())
         renderer = types.ModuleType("render")
         renderer.render_session = Mock()
         with patch.dict(sys.modules, {"render": renderer}):
             hooks.hook(self.event("Stop"))
         saved = json.loads((self.turn / "session.json").read_text())
         self.assertEqual([a["id"] for a in saved["actions"]], ["one", "two"])
+        self.assertEqual(hooks.hook(self.event("PostToolUse", tool_use_id="two", tool_response={"content": [image()]})), {})
+        self.assertEqual(json.loads((self.turn / "session.json").read_text()), saved)
+
+    def test_hook_process_avoids_heavy_imports(self):
+        self.spawn_patch.stop()
+        result = subprocess.run([sys.executable, "-S", "-X", "importtime", str(SCRIPT), "hook"], input="{}",
+                                text=True, capture_output=True, check=False)
+        self.assertEqual(result.stdout.strip(), "{}")
+        loaded = {line.split("|")[-1].strip() for line in result.stderr.splitlines() if line.startswith("import time:")}
+        self.assertFalse(loaded & {"argparse", "subprocess", "hashlib", "tempfile", "uuid", "base64", "shutil"}, loaded)
 
     def test_stop_queues_pinned_turn_then_worker_renders_once_per_manifest(self):
         self.collect([image()], recorded_at=10)
@@ -326,6 +340,8 @@ class HookTests(unittest.TestCase):
         self.assertFalse(config['Stop'][0]['hooks'][0].get('async', False))
         for event in ('PreToolUse', 'PostToolUse', 'SessionStart'):
             self.assertFalse(config[event][0]['hooks'][0].get('async', False))
+        self.assertEqual(config['PostToolUse'][0]['matcher'], '^mcp__cua_repl(__|\\.)js_reset$')
+        self.assertNotIn('PostToolUseFailure', config)
         self.pre('let app = await cua.getApp("Example");')
         with patch.dict(os.environ, {'SHOWANDTELL_CAPTURE': 'full'}):
             injected = self.pre('await app.click([1, 2]);')['hookSpecificOutput']['updatedInput']['code']
@@ -381,7 +397,7 @@ class HookTests(unittest.TestCase):
             self.assertEqual(first_output, second_output)
             self.assertNotIn('permissionDecision', first_output)
             self.assertEqual(first_output['updatedInput']['timeout_ms'], 5000)
-            self.assertIn('__showandtell.wrap(app, "app")', first_output['updatedInput']['code'])
+            self.assertIn('__showandtell.instrument(app, "app", "Example")', first_output['updatedInput']['code'])
             turn = self.home / 'claude-session-1' / runtime['current_turn']
             self.assertEqual(len(list((turn / 'captures').iterdir())), 1)
             hooks.hook(self.claude_event('PostToolUse', tool_name='mcp__codex-cu__js_reset'))
@@ -404,14 +420,15 @@ class HookTests(unittest.TestCase):
             hooks.hook(self.claude_event('PreToolUse', tool_use_id='failed', tool_input=args))
             folder = turn / 'captures' / hooks.capture_id('failed')
             (folder / 'events.jsonl').write_text(marker('action', id='a', type='click', t=1))
-            hooks.hook(self.claude_event('PostToolUseFailure', tool_use_id='failed',
-                                       tool_response={'content': [image()]}, error='private error'))
+            # A failed call's recording is collected by the next call; its error text is never read.
+            self.assertEqual(hooks.hook(self.claude_event('PostToolUseFailure', tool_use_id='failed',
+                                                          tool_response={'content': [image()]}, error='private error')), {})
+            hooks.hook(self.claude_event('PreToolUse', tool_use_id='next', tool_input=args))
             captured = json.loads((turn / 'session.json').read_text())
             self.assertEqual(len(captured['actions']), 1)
             self.assertEqual(captured['frames'], [])
+            self.assertFalse(folder.exists())
             self.assertNotIn('private error', json.dumps(captured))
-            hooks.hook(self.claude_event('PostToolUseFailure', tool_use_id='empty', tool_response={'content': [image()]}))
-            self.assertEqual(json.loads((turn / 'session.json').read_text()), captured)
 
     def test_claude_session_end_queues_every_pending_turn_and_config_is_scoped(self):
         with patch.dict(os.environ, {'SHOWANDTELL_CLIENT': 'claude'}):
@@ -433,6 +450,8 @@ class HookTests(unittest.TestCase):
                 self.assertEqual(json.loads((turn / 'export.json').read_text())['status'], 'queued')
         config = json.loads((ROOT / 'plugins/showandtell/hooks/claude.json').read_text())
         self.assertEqual(set(config), {'hooks'})
+        self.assertEqual(config['hooks']['PostToolUse'][0]['matcher'], '^mcp__codex-cu__js_reset$')
+        self.assertNotIn('PostToolUseFailure', config['hooks'])
         for event, entries in config['hooks'].items():
             entry = entries[0]
             command = entry['hooks'][0]
