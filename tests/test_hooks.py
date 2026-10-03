@@ -301,6 +301,15 @@ class HookTests(unittest.TestCase):
         self.assertEqual(hooks.hook(self.event("PostToolUse", tool_use_id="two", tool_response={"content": [image()]})), {})
         self.assertEqual(json.loads((self.turn / "session.json").read_text()), saved)
 
+    def test_plugin_layout_lets_codex_discover_hooks(self):
+        # Codex reads a root plugin.json first when one exists and then discovers no hooks
+        # at all (verified against Codex 0.159: hooks/list omitted the plugin until the file
+        # was removed). The manifest must stay at .codex-plugin/plugin.json only.
+        plugin = ROOT / "plugins/showandtell"
+        self.assertFalse((plugin / "plugin.json").exists())
+        self.assertTrue((plugin / ".codex-plugin/plugin.json").is_file())
+        self.assertTrue((plugin / "hooks/hooks.json").is_file())
+
     def test_hook_process_avoids_heavy_imports(self):
         self.spawn_patch.stop()
         result = subprocess.run([sys.executable, "-S", "-X", "importtime", str(SCRIPT), "hook"], input="{}",

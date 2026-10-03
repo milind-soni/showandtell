@@ -39,6 +39,10 @@ For the browser fixture, clone the repository and run `python3 -m http.server 87
 3. **Unavailable capture storage.** Test with local writes blocked in a disposable runtime. Expect a storage warning while the requested UI action remains usable. Do not weaken permissions, upload data, or claim a complete recording.
 4. **Reuse without images.** Set `SHOWANDTELL_CAPTURE=reuse`, start a new chat, and perform actions followed only by `getAXState`. Expect saved action metadata and an explicit no-frames warning, with no fabricated video or extra screenshot requests. Default `actions` mode instead requests a screenshot after each action.
 
+## Release notes: 0.5.1
+
+Removes the root `plugin.json` added in 0.4.0/0.5.0. Codex reads a root manifest first when one exists and then discovers no hooks, so `/hooks` never listed Showandtell and nothing was recorded. The manifest is `.codex-plugin/plugin.json` only; a packaging check and a test keep it that way. After upgrading, review the changed `PostToolUse` and `Stop` hooks in `/hooks` and start a new chat.
+
 ## Release notes: 0.5.0
 
 Mac text-only observations are now video frames at no extra cost: the engine already takes a screenshot for `getAXState`, and the recorder keeps it by making the same public engine call instead of letting the image be discarded. After a Showandtell screenshot the agent's next `getAXState` on that app returns a full tree so it never wrongly reports "no change".

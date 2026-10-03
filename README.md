@@ -2,7 +2,7 @@
 
 Turn Codex computer use into a local video. Showandtell keeps the screenshots the computer-use engine already takes, including the ones behind text-only accessibility observations, adds a smooth animated cursor, and renders an MP4 in the background. No screen recorder, recording server, account, or editor.
 
-[Install](#install) · [Claude Code](#claude-code-experimental) · [Performance](#performance) · [Download v0.5.0](https://github.com/milind-soni/showandtell/releases/tag/v0.5.0)
+[Install](#install) · [Claude Code](#claude-code-experimental) · [Performance](#performance) · [Download v0.5.1](https://github.com/milind-soni/showandtell/releases/tag/v0.5.1)
 
 [Watch the browser demo](demo/showandtell.mp4)
 
@@ -94,6 +94,7 @@ Remove the Codex plugin with `codex plugin remove showandtell@showandtell`. For 
 | An existing local marketplace is named `showandtell` | Update that local source and reinstall with `codex plugin add showandtell@showandtell`. The public installer does not replace it. |
 | No video | Check hook enablement, start a new chat, and use unified computer use. Shell, API, and text-only browser actions have no video frames. |
 | Hook points to a missing old version | Start a new chat or restart the agent to load current hooks. |
+| `/hooks` does not list Showandtell at all | You have 0.5.0, whose root `plugin.json` hid the hooks from Codex. Reinstall with `codex plugin add showandtell@showandtell`, then review the hooks in `/hooks`. |
 | Clicks appear twice in `session.json` | An older recorder from a long-running chat wrapped the new one. Start a new chat after upgrading. |
 | `capture-storage-unavailable` with `code: EPERM` | The engine ran the recorder read-only. This is the normal state outside Codex (see the Claude section); inside Codex, check the thread's sandbox settings. |
 | Claude cannot find the Mac runtime | Open/update Codex desktop with computer use installed, then rerun Claude setup. |
@@ -116,7 +117,7 @@ There is no continuously running Showandtell daemon. The capture and encoder use
 
 **Lightweight does not mean zero overhead.** Per computer-use call there is one hook process before the call (none after), a small JavaScript prelude that is parsed but not re-executed, and small local writes awaited inside the call so frames survive its end. Export starts separately, so the turn does not wait for FFmpeg; rendering still consumes CPU and disk.
 
-| Measurement | 0.4.0 | 0.5.0 | Scope |
+| Measurement | 0.4.0 | 0.5.1 | Scope |
 | --- | --- | --- | --- |
 | Hook process per call | 2 × ~130–150 ms | 1 × ~28 ms | Pre + Post before; Pre only now. Apple M5, load average 5; Python 3.14 startup is ~10 ms of it. |
 | Frame for a Mac `getAXState` | not captured | 0 extra engine calls | The engine already took it; the recorder keeps the file it returns. |
@@ -166,13 +167,13 @@ Marker logs omit typed text, key values, URLs, app names, and raw tool code. **S
 
 ## Packaging and development
 
-The plugin has a portable `plugin.json` plus the Codex compatibility manifest. OpenAI directory publication remains separate; see [SUBMISSION.md](SUBMISSION.md). Build the archive with:
+The plugin manifest is `.codex-plugin/plugin.json`, and there is deliberately no root `plugin.json`: Codex reads a root manifest first when one exists and then discovers no hooks at all (0.5.0 shipped one and lost its hooks). OpenAI directory publication remains separate; see [SUBMISSION.md](SUBMISSION.md). Build the archive with:
 
 ```sh
 python3 scripts/package.py
 ```
 
-This creates `dist/showandtell-0.5.0.zip` and its SHA-256 checksum. The archive includes only plugin files, excluding captures and development material. Claude setup discovers the runtime already installed on your Mac; that runtime is not redistributed.
+This creates `dist/showandtell-0.5.1.zip` and its SHA-256 checksum. The archive includes only plugin files, excluding captures and development material. Claude setup discovers the runtime already installed on your Mac; that runtime is not redistributed.
 
 No Python or Node packages are required. Node is needed only for recorder checks:
 
